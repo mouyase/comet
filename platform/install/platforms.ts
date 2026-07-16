@@ -12,6 +12,9 @@ export interface Platform {
   name: string;
   skillsDir: string;
   globalSkillsDir?: string;
+  legacySkillsDirs?: string[];
+  /** Platform configuration and hook root when it differs from the Skill root. */
+  configDir?: string;
   detectionPaths?: string[];
   openspecToolId: string;
   /** Platform's rules/instructions subdirectory relative to rulesBaseDir (defaults to baseDir). Omit if unsupported. */
@@ -23,7 +26,19 @@ export interface Platform {
   /** Whether this platform supports PreToolUse hooks. */
   supportsHooks?: boolean;
   /** Hook configuration format. Determines how installCometHooksForPlatform writes the hook config. */
-  hookFormat?: 'claude-code' | 'gemini' | 'windsurf' | 'copilot' | 'qwen' | 'kiro' | 'qoder';
+  hookFormat?:
+    | 'claude-code'
+    | 'gemini'
+    | 'windsurf'
+    | 'copilot'
+    | 'qwen'
+    | 'kiro'
+    | 'qoder'
+    | 'codebuddy';
+  /** Hook config filename relative to the platform config root when it differs from the format default. */
+  hookConfigFile?: string;
+  /** Historical hook config filenames checked during migration and uninstall. */
+  legacyHookConfigFiles?: string[];
 }
 
 export function getPlatformSkillsDir(platform: Platform, scope: InstallScope): string {
@@ -34,7 +49,13 @@ export function getPlatformSkillsDir(platform: Platform, scope: InstallScope): s
 }
 
 export function getPlatformSkillsDirs(platform: Platform, scope: InstallScope): string[] {
-  return [getPlatformSkillsDir(platform, scope)];
+  return [
+    ...new Set([getPlatformSkillsDir(platform, scope), ...(platform.legacySkillsDirs ?? [])]),
+  ];
+}
+
+export function getPlatformConfigDir(platform: Platform, scope: InstallScope): string {
+  return platform.configDir ?? getPlatformSkillsDir(platform, scope);
 }
 
 export const PLATFORMS: Platform[] = [
@@ -61,13 +82,19 @@ export const PLATFORMS: Platform[] = [
   {
     id: 'codex',
     name: 'Codex',
-    skillsDir: '.codex',
-    globalSkillsDir: '.codex',
+    skillsDir: '.agents',
+    globalSkillsDir: '.agents',
+    legacySkillsDirs: ['.codex'],
+    configDir: '.codex',
+    detectionPaths: ['.codex'],
     openspecToolId: 'codex',
+    rulesBaseDir: '.codex',
     rulesDir: 'rules',
     rulesFormat: 'md',
     supportsHooks: true,
     hookFormat: 'claude-code',
+    hookConfigFile: 'hooks.json',
+    legacyHookConfigFiles: ['settings.local.json'],
   },
   {
     id: 'opencode',
@@ -215,7 +242,15 @@ export const PLATFORMS: Platform[] = [
     rulesFormat: 'md',
   },
   { id: 'junie', name: 'Junie', skillsDir: '.junie', openspecToolId: 'junie' },
-  { id: 'codebuddy', name: 'CodeBuddy Code', skillsDir: '.codebuddy', openspecToolId: 'codebuddy' },
+  {
+    id: 'codebuddy',
+    name: 'CodeBuddy Code',
+    skillsDir: '.codebuddy',
+    globalSkillsDir: '.codebuddy',
+    openspecToolId: 'codebuddy',
+    supportsHooks: true,
+    hookFormat: 'codebuddy',
+  },
   { id: 'costrict', name: 'CoStrict', skillsDir: '.cospec', openspecToolId: 'costrict' },
   { id: 'crush', name: 'Crush', skillsDir: '.crush', openspecToolId: 'crush' },
   { id: 'factory', name: 'Factory Droid', skillsDir: '.factory', openspecToolId: 'factory' },

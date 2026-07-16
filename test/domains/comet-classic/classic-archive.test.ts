@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
+import { annotatedMarkdown } from '../../../domains/comet-classic/classic-archive.js';
 import { readRunState } from '../../../domains/engine/state.js';
 
 const scriptsDir = path.resolve('assets', 'skills', 'comet', 'scripts');
@@ -65,6 +66,75 @@ async function seedDocsArchiveChange(dir: string, name = 'add-auth'): Promise<st
   run(dir, ['state', 'set', name, 'verify_result', 'pass']);
   return path.join(dir, 'docs', 'openspec', 'changes', name);
 }
+
+function confirmArchiveChange(dir: string, name = 'demo'): void {
+  const result = run(dir, ['state', 'transition', name, 'archive-confirm']);
+  expect(result.status).toBe(0);
+}
+
+describe('annotatedMarkdown', () => {
+  it('preserves an existing frontmatter document with one final newline', () => {
+    const original = '---\ntitle: Demo\n---\nBody\n';
+
+    expect(annotatedMarkdown(original, '2026-07-11-demo', '')).toBe(
+      '---\ntitle: Demo\narchived-with: 2026-07-11-demo\n---\nBody\n',
+    );
+  });
+
+  it('preserves blank and comment lines when no extra frontmatter field is replaced', () => {
+    const original = '---\ntitle: Demo\n\n# keep this context\n---\nBody\n';
+
+    expect(annotatedMarkdown(original, '2026-07-11-demo', '')).toBe(
+      '---\ntitle: Demo\n\n# keep this context\narchived-with: 2026-07-11-demo\n---\nBody\n',
+    );
+  });
+
+  it('collapses multiple EOF blank lines to exactly one final newline', () => {
+    const original = '---\ntitle: Demo\n---\nBody\n\n\n';
+
+    expect(annotatedMarkdown(original, '2026-07-11-demo', '')).toBe(
+      '---\ntitle: Demo\narchived-with: 2026-07-11-demo\n---\nBody\n',
+    );
+  });
+
+  it('adds frontmatter to a document without frontmatter or a final newline', () => {
+    expect(annotatedMarkdown('Body', '2026-07-11-demo', '')).toBe(
+      '---\narchived-with: 2026-07-11-demo\nstatus: final\n---\nBody\n',
+    );
+  });
+
+  it('preserves internal blank lines and normalizes CRLF to LF', () => {
+    const original = '---\r\ntitle: Demo\r\n---\r\nFirst\r\n\r\nSecond\r\n';
+
+    expect(annotatedMarkdown(original, '2026-07-11-demo', '')).toBe(
+      '---\ntitle: Demo\narchived-with: 2026-07-11-demo\n---\nFirst\n\nSecond\n',
+    );
+  });
+
+  it('does not annotate a later thematic delimiter in the body', () => {
+    const original = '---\ntitle: Demo\n---\nBefore\n---\nAfter\n';
+
+    expect(annotatedMarkdown(original, '2026-07-11-demo', '')).toBe(
+      '---\ntitle: Demo\narchived-with: 2026-07-11-demo\n---\nBefore\n---\nAfter\n',
+    );
+  });
+
+  it('replaces existing archive and extra fields without duplication', () => {
+    const original =
+      '---\narchived-with: old-archive\ntitle: Demo\nstatus: draft\narchived-with: older-archive\nstatus: review\n---\nBody\n';
+
+    expect(annotatedMarkdown(original, '2026-07-11-demo', 'status: final')).toBe(
+      '---\ntitle: Demo\narchived-with: 2026-07-11-demo\nstatus: final\n---\nBody\n',
+    );
+  });
+
+  it('is byte-identical when repeated with the same inputs', () => {
+    const original = '---\r\ntitle: Demo\r\nstatus: draft\r\n---\r\nBody\r\n\r\n';
+    const once = annotatedMarkdown(original, '2026-07-11-demo', 'status: final');
+
+    expect(annotatedMarkdown(once, '2026-07-11-demo', 'status: final')).toBe(once);
+  });
+});
 
 async function fakeOpenSpec(
   dir: string,
@@ -146,9 +216,28 @@ describe('Classic archive command', () => {
     });
   });
 
+  it('rejects mutating archive before final archive confirmation', async () => {
+    const dir = await makeProject();
+    const changeDir = await seedArchiveChange(dir);
+    const fake = await fakeOpenSpec(dir, 'success');
+
+    const result = run(dir, ['archive', 'demo'], { COMET_OPENSPEC: fake.command });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('archive_confirmation');
+    await expect(fs.access(fake.log)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.access(changeDir)).resolves.toBeUndefined();
+    const state = parse(await fs.readFile(path.join(changeDir, '.comet.yaml'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(state.archived).toBe(false);
+  });
+
   it('archives a verified change and completes its Run transaction', async () => {
     const dir = await makeProject();
     await seedArchiveChange(dir);
+    confirmArchiveChange(dir);
     const fake = await fakeOpenSpec(dir, 'success');
 
     const result = run(dir, ['archive', 'demo'], { COMET_OPENSPEC: fake.command });
@@ -189,6 +278,7 @@ describe('Classic archive command', () => {
   it('passes --store when archiving docs layout changes', async () => {
     const dir = await makeProject();
     await seedDocsArchiveChange(dir);
+    confirmArchiveChange(dir, 'add-auth');
     const fake = await fakeOpenSpec(dir, 'success', 'docs/openspec/changes');
 
     const result = run(dir, ['archive', 'add-auth'], { COMET_OPENSPEC: fake.command });
@@ -224,6 +314,7 @@ describe('Classic archive command', () => {
   it('treats a completed archive retry as an idempotent no-op', async () => {
     const dir = await makeProject();
     await seedArchiveChange(dir);
+    confirmArchiveChange(dir);
     const fake = await fakeOpenSpec(dir, 'success');
     expect(run(dir, ['archive', 'demo'], { COMET_OPENSPEC: fake.command }).status).toBe(0);
     const archiveDir = path.join(
@@ -247,6 +338,7 @@ describe('Classic archive command', () => {
   it('keeps a recoverable pending marker when OpenSpec fails before moving files', async () => {
     const dir = await makeProject();
     const changeDir = await seedArchiveChange(dir);
+    confirmArchiveChange(dir);
     const fake = await fakeOpenSpec(dir, 'fail');
 
     const result = run(dir, ['archive', 'demo'], { COMET_OPENSPEC: fake.command });
@@ -268,6 +360,7 @@ describe('Classic archive command', () => {
   it('reconciles an archive that moved before the external process was interrupted', async () => {
     const dir = await makeProject();
     await seedArchiveChange(dir);
+    confirmArchiveChange(dir);
     const interrupted = await fakeOpenSpec(dir, 'move-fail');
     expect(run(dir, ['archive', 'demo'], { COMET_OPENSPEC: interrupted.command }).status).toBe(9);
     const logBeforeRetry = await fs.readFile(interrupted.log, 'utf8');

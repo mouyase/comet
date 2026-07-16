@@ -54,10 +54,12 @@ describe('Classic evidence collection', () => {
         designDoc: 'docs/superpowers/specs/demo-design.md',
         plan: 'docs/superpowers/plans/demo-plan.md',
         verifyResult: 'pass',
+        verifyFailures: 0,
         verificationReport: 'docs/superpowers/verification/demo.md',
         branchStatus: 'handled',
         createdAt: '2026-06-14',
         verifiedAt: '2026-06-14',
+        archiveConfirmation: null,
         archived: false,
         directOverride: null,
         handoffContext: 'openspec/changes/demo/.comet/handoff/context.json',
@@ -213,6 +215,14 @@ describe('Classic evidence collection', () => {
         retryDelay: 100,
       });
     }
+  });
+
+  it('derives archive confirmation evidence from Classic state', async () => {
+    projection.classic!.archiveConfirmation = 'confirmed';
+
+    const evidence = await collectClassicEvidence(changeDir, projection);
+
+    expect(evidenceSatisfied(evidence, 'archive.confirmed')).toBe(true);
   });
 
   async function writeProjectFile(relativePath: string, content: string): Promise<void> {

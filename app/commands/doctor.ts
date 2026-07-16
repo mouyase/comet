@@ -1,12 +1,14 @@
 import path from 'path';
 import os from 'os';
-import { execSync } from 'child_process';
 import { promises as fs } from 'fs';
 import { parseDocument } from 'yaml';
 import { fileExists, readDir } from '../../platform/fs/file-system.js';
 import {
   assertOpenSpecStoreHealth,
+  getOpenSpecVersion,
   isCommandAvailable,
+  isOpenSpecVersionCompatible,
+  MINIMUM_OPENSPEC_VERSION,
 } from '../../domains/integrations/openspec.js';
 import {
   hasCodegraphProjectIndex,
@@ -17,7 +19,16 @@ import {
   getAssetsDir,
   getManagedSkillPaths,
 } from '../../domains/skill/platform-install.js';
-import { PLATFORMS, getPlatformSkillsDirs } from '../../platform/install/platforms.js';
+import {
+  getPlatformRuleDestinations,
+  inspectCometHooksForPlatform,
+} from '../../domains/skill/platform-inspect.js';
+import {
+  PLATFORMS,
+  getPlatformSkillsDirs,
+  type Platform,
+} from '../../platform/install/platforms.js';
+import { resolveCanonicalSkillRootOwners } from '../../platform/install/skill-root-owner.js';
 import type { InstallScope } from '../../platform/install/types.js';
 import { inspectClassicChange } from '../../domains/comet-classic/classic-diagnostics.js';
 import { getCurrentVersion } from '../../platform/version/version.js';
@@ -66,14 +77,15 @@ async function checkOpenSpecCli(): Promise<CheckResult> {
       message: 'not installed — install with: npm install -g @fission-ai/openspec@latest',
     };
   }
-  try {
-    const version = execSync('openspec --version', { stdio: 'pipe', timeout: 10_000 })
-      .toString()
-      .trim();
-    return { check: 'openspec CLI', status: 'pass', message: `installed (${version})` };
-  } catch {
-    return { check: 'openspec CLI', status: 'pass', message: 'installed' };
+  const version = getOpenSpecVersion();
+  if (!version || !isOpenSpecVersionCompatible(version)) {
+    return {
+      check: 'openspec CLI',
+      status: 'warn',
+      message: `installed (${version || 'version unknown'}), but Comet requires >= ${MINIMUM_OPENSPEC_VERSION} — run: npm install -g @fission-ai/openspec@latest`,
+    };
   }
+  return { check: 'openspec CLI', status: 'pass', message: `installed (${version})` };
 }
 
 function checkEnvironment(projectPath: string, context: DoctorContext): CheckResult {
@@ -363,6 +375,65 @@ function getScopeBases(
   return bases;
 }
 
+async function checkPlatformComponents(
+  baseDir: string,
+  platform: (typeof PLATFORMS)[number],
+  scope: InstallScope,
+): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  const ruleDestinations = await getPlatformRuleDestinations(baseDir, platform, scope);
+  if (ruleDestinations.length > 0) {
+    let present = 0;
+    const inspectionErrors: string[] = [];
+    for (const destination of ruleDestinations) {
+      try {
+        if (await fileExists(destination)) present++;
+      } catch (error) {
+        inspectionErrors.push(`${destination}: ${(error as Error).message}`);
+      }
+    }
+    results.push({
+      check: `rules: ${platform.name} (${scope})`,
+      status:
+        inspectionErrors.length === 0 && present === ruleDestinations.length ? 'pass' : 'warn',
+      message:
+        inspectionErrors.length > 0
+          ? `unable to inspect managed Rule (${inspectionErrors.join('; ')}) — run: comet update --scope ${scope}`
+          : present === ruleDestinations.length
+            ? `complete (${present} files)`
+            : `partial (${present}/${ruleDestinations.length} files) — run: comet update --scope ${scope}`,
+    });
+  }
+
+  if (platform.supportsHooks && platform.hookFormat) {
+    const inspection = await inspectCometHooksForPlatform(baseDir, platform, scope);
+    results.push({
+      check: `hooks: ${platform.name} (${scope})`,
+      status: inspection.present ? 'pass' : 'warn',
+      message: inspection.present
+        ? 'managed Hook present'
+        : `${inspection.error ?? 'managed Hook missing'} — run: comet update --scope ${scope}`,
+    });
+  }
+
+  return results;
+}
+
+async function getPlatformsForSkillInspection(
+  baseDir: string,
+  scope: InstallScope,
+  doctorScope: DoctorScope,
+): Promise<Array<{ platform: Platform; inspectComponents: boolean }>> {
+  return (
+    await resolveCanonicalSkillRootOwners(baseDir, scope, {
+      respectDetectionPaths: doctorScope === 'auto',
+    })
+  ).map(({ platform, hasOwnershipEvidence, sharedCanonicalRoot }) => ({
+    platform,
+    inspectComponents: !sharedCanonicalRoot || hasOwnershipEvidence,
+  }));
+}
+
 async function checkSkillCompleteness(
   projectPath: string,
   scope: DoctorScope,
@@ -379,48 +450,58 @@ async function checkSkillCompleteness(
     global: { hasInstall: false, hasComplete: false },
   };
   for (const base of getScopeBases(projectPath, scope, context)) {
-    for (const platform of PLATFORMS) {
-      const detectedSkillsDir = (
-        await Promise.all(
-          getPlatformSkillsDirs(platform, base.scope).map(async (skillsDir) => ({
-            skillsDir,
-            exists: await fileExists(path.join(base.baseDir, skillsDir, 'skills')),
-          })),
-        )
-      ).find((candidate) => candidate.exists)?.skillsDir;
-      if (!detectedSkillsDir) continue;
-
-      const present: string[] = [];
-      const missing: string[] = [];
-      for (const relPath of managedSkills) {
-        const fullPath = path.join(base.baseDir, detectedSkillsDir, 'skills', relPath);
-        if (await fileExists(fullPath)) {
-          present.push(relPath);
-        } else {
-          missing.push(relPath);
+    const platforms = await getPlatformsForSkillInspection(base.baseDir, base.scope, scope);
+    for (const { platform, inspectComponents } of platforms) {
+      const skillsDirs = getPlatformSkillsDirs(platform, base.scope);
+      const canonicalSkillsDir = skillsDirs[0];
+      let detectedSkillsDir: string | undefined;
+      let present: string[] = [];
+      let missing: string[] = [];
+      for (const skillsDir of skillsDirs) {
+        const candidatePresent: string[] = [];
+        const candidateMissing: string[] = [];
+        for (const relPath of managedSkills) {
+          const fullPath = path.join(base.baseDir, skillsDir, 'skills', relPath);
+          if (await fileExists(fullPath)) candidatePresent.push(relPath);
+          else candidateMissing.push(relPath);
         }
+        if (candidatePresent.length === 0) continue;
+        detectedSkillsDir = skillsDir;
+        present = candidatePresent;
+        missing = candidateMissing;
+        break;
       }
 
-      if (present.length === 0) continue;
+      if (!detectedSkillsDir) continue;
       anyCometInstall = true;
       scopeState[base.scope].hasInstall = true;
-      if (missing.length === 0) {
+      const isLegacy = detectedSkillsDir !== canonicalSkillsDir;
+      if (missing.length === 0 && !isLegacy) {
         scopeState[base.scope].hasComplete = true;
       }
 
       results.push(
-        missing.length === 0
+        isLegacy
           ? {
               check: `skills: ${platform.name} (${base.scope})`,
-              status: 'pass' as const,
-              message: `complete (${total} files)`,
-            }
-          : {
-              check: `skills: ${platform.name} (${base.scope})`,
               status: 'warn' as const,
-              message: `partial (${present.length}/${total} files; missing ${missing.length}) — run: comet update --scope ${base.scope}`,
-            },
+              message: `legacy installation (${present.length}/${total} files) — run: comet update --scope ${base.scope}`,
+            }
+          : missing.length === 0
+            ? {
+                check: `skills: ${platform.name} (${base.scope})`,
+                status: 'pass' as const,
+                message: `complete (${total} files)`,
+              }
+            : {
+                check: `skills: ${platform.name} (${base.scope})`,
+                status: 'warn' as const,
+                message: `partial (${present.length}/${total} files; missing ${missing.length}) — run: comet update --scope ${base.scope}`,
+              },
       );
+      if (inspectComponents) {
+        results.push(...(await checkPlatformComponents(base.baseDir, platform, base.scope)));
+      }
     }
   }
 

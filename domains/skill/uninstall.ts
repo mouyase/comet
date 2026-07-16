@@ -1,5 +1,5 @@
 import path from 'path';
-import { readFile, writeFile } from 'fs/promises';
+import { lstat, writeFile } from 'fs/promises';
 
 import {
   fileExists,
@@ -8,15 +8,22 @@ import {
   removeDir,
   isDirEmpty,
 } from '../../platform/fs/file-system.js';
-import { getPlatformSkillsDir, type Platform } from '../../platform/install/platforms.js';
+import {
+  getPlatformConfigDir,
+  getPlatformSkillsDir,
+  getPlatformSkillsDirs,
+  type Platform,
+} from '../../platform/install/platforms.js';
 import type { InstallScope } from '../../platform/install/types.js';
 import {
   readManifest,
   getManagedSkillPaths,
   computeRuleDestPath,
   isManagedHookCommand,
+  removeManagedHooksFromJsonFile,
 } from './platform-install.js';
 import { removeCometProjectInstructions } from './project-instructions.js';
+import { readJsonObjectFile } from './json-object.js';
 
 interface RemovalResult {
   removed: number;
@@ -24,6 +31,92 @@ interface RemovalResult {
 }
 
 const OPENCODE_STYLE_PLATFORM_IDS = new Set(['opencode', 'mimocode']);
+
+async function removeManagedSkillsFromDirs(
+  baseDir: string,
+  skillsDirs: string[],
+  managedSkills: string[],
+): Promise<RemovalResult> {
+  let removed = 0;
+  let failed = 0;
+  const parentDirs = new Set<string>();
+  for (const skillsDir of skillsDirs) {
+    const platformRoot = path.join(baseDir, skillsDir);
+    const skillsRoot = path.join(baseDir, skillsDir, 'skills');
+    let sharedBoundary = false;
+    for (const boundary of [platformRoot, skillsRoot]) {
+      try {
+        if ((await lstat(boundary)).isSymbolicLink()) {
+          failed++;
+          sharedBoundary = true;
+          break;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          failed++;
+          sharedBoundary = true;
+          break;
+        }
+      }
+    }
+    if (sharedBoundary) continue;
+
+    for (const skillRelPath of managedSkills) {
+      try {
+        const parts = skillRelPath.split('/');
+        let current = baseDir;
+        let linkedAncestor = false;
+        const ancestorParts = [
+          ...skillsDir.split(/[\\/]/u).filter(Boolean),
+          'skills',
+          ...parts.slice(0, -1),
+        ];
+        for (const part of ancestorParts) {
+          current = path.join(current, part);
+          if ((await lstat(current)).isSymbolicLink()) {
+            if (await removeFile(current)) removed++;
+            linkedAncestor = true;
+            break;
+          }
+        }
+        if (linkedAncestor) continue;
+
+        if (await removeFile(path.join(skillsRoot, ...parts))) removed++;
+        current = skillsRoot;
+        for (const part of parts.slice(0, -1)) {
+          current = path.join(current, part);
+          parentDirs.add(current);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') failed++;
+      }
+    }
+  }
+
+  for (const dir of [...parentDirs].sort(
+    (left, right) => right.split(path.sep).length - left.split(path.sep).length,
+  )) {
+    try {
+      if (await isDirEmpty(dir)) await removeDir(dir);
+    } catch {
+      failed++;
+    }
+  }
+  return { removed, failed };
+}
+
+export async function removeLegacyCometSkillsForPlatform(
+  baseDir: string,
+  platform: Platform,
+  scope: InstallScope = 'project',
+): Promise<RemovalResult> {
+  const canonicalDir = getPlatformSkillsDir(platform, scope);
+  const legacyDirs = getPlatformSkillsDirs(platform, scope).filter((dir) => dir !== canonicalDir);
+  if (legacyDirs.length === 0) return { removed: 0, failed: 0 };
+
+  const managedSkills = getManagedSkillPaths(await readManifest());
+  return removeManagedSkillsFromDirs(baseDir, legacyDirs, managedSkills);
+}
 
 async function removeCometSkillsForPlatform(
   baseDir: string,
@@ -33,23 +126,15 @@ async function removeCometSkillsForPlatform(
   const manifest = await readManifest();
   const managedSkills = getManagedSkillPaths(manifest);
   const skillsDir = getPlatformSkillsDir(platform, scope);
-  const skillsDirs = [skillsDir];
-  if (scope === 'global' && platform.id === 'pi') {
-    skillsDirs.push(platform.skillsDir);
-  }
-  const uniqueSkillsDirs = [...new Set(skillsDirs)];
-  let removed = 0;
-  const failed = 0;
-
-  for (const targetSkillsDir of uniqueSkillsDirs) {
-    for (const skillRelPath of managedSkills) {
-      const dest = path.join(baseDir, targetSkillsDir, 'skills', skillRelPath);
-      const result = await removeFile(dest);
-      if (result) {
-        removed++;
-      }
-    }
-  }
+  const uniqueSkillsDirs = [
+    ...new Set([
+      ...getPlatformSkillsDirs(platform, scope),
+      ...(scope === 'global' && platform.id === 'pi' ? [platform.skillsDir] : []),
+    ]),
+  ];
+  const skillsRemoval = await removeManagedSkillsFromDirs(baseDir, uniqueSkillsDirs, managedSkills);
+  let removed = skillsRemoval.removed;
+  let failed = skillsRemoval.failed;
 
   if (OPENCODE_STYLE_PLATFORM_IDS.has(platform.id)) {
     const commandsDir = path.join(baseDir, skillsDir, 'commands');
@@ -59,44 +144,32 @@ async function removeCometSkillsForPlatform(
 
       const skillName = parts[0];
       const commandFile = path.join(commandsDir, `${skillName}.md`);
-      const result = await removeFile(commandFile);
-      if (result) {
-        removed++;
+      try {
+        const result = await removeFile(commandFile);
+        if (result) {
+          removed++;
+        }
+      } catch {
+        failed++;
       }
     }
   }
 
   if (platform.id === 'pi') {
     const extensionsDir = path.join(baseDir, skillsDir, 'extensions');
-    if (await removeFile(path.join(extensionsDir, 'comet-commands.ts'))) {
-      removed++;
-    }
-    if (await isDirEmpty(extensionsDir)) {
-      await removeDir(extensionsDir);
-    }
-  }
-
-  const parentDirs = new Set<string>();
-  for (const targetSkillsDir of uniqueSkillsDirs) {
-    for (const skillRelPath of managedSkills) {
-      const parts = skillRelPath.split('/');
-      if (parts[0].startsWith('comet')) {
-        let current = path.join(baseDir, targetSkillsDir, 'skills', parts[0]);
-        parentDirs.add(current);
-        for (let i = 1; i < parts.length - 1; i++) {
-          current = path.join(current, parts[i]);
-          parentDirs.add(current);
-        }
+    try {
+      if (await removeFile(path.join(extensionsDir, 'comet-commands.ts'))) {
+        removed++;
       }
+    } catch {
+      failed++;
     }
-  }
-
-  const sortedDirs = [...parentDirs].sort(
-    (a, b) => b.split(path.sep).length - a.split(path.sep).length,
-  );
-  for (const dir of sortedDirs) {
-    if (await isDirEmpty(dir)) {
-      await removeDir(dir);
+    try {
+      if (await isDirEmpty(extensionsDir)) {
+        await removeDir(extensionsDir);
+      }
+    } catch {
+      failed++;
     }
   }
 
@@ -127,22 +200,30 @@ async function removeCometRulesForPlatform(
       : path.join(baseDir, skillsDir);
 
   let removed = 0;
-  const failed = 0;
+  let failed = 0;
 
   for (const ruleRelPath of rulePaths) {
     const ruleFileName = path.basename(ruleRelPath);
     const rulesDestDir = path.join(rulesBase, platform.rulesDir);
     const dest = computeRuleDestPath(rulesDestDir, ruleFileName, platform.rulesFormat);
 
-    const result = await removeFile(dest);
-    if (result) {
-      removed++;
+    try {
+      const result = await removeFile(dest);
+      if (result) {
+        removed++;
+      }
+    } catch {
+      failed++;
     }
   }
 
   const rulesDestDir = path.join(rulesBase, platform.rulesDir);
-  if (await isDirEmpty(rulesDestDir)) {
-    await removeDir(rulesDestDir);
+  try {
+    if (await isDirEmpty(rulesDestDir)) {
+      await removeDir(rulesDestDir);
+    }
+  } catch {
+    failed++;
   }
 
   return { removed, failed };
@@ -164,25 +245,44 @@ async function removeCometHooksForPlatform(
   }
 
   const hookFormat = platform.hookFormat;
-  const skillsDir = getPlatformSkillsDir(platform, scope);
-  const platformBase = path.join(baseDir, skillsDir);
+  const platformBase = path.join(baseDir, getPlatformConfigDir(platform, scope));
   const scriptRelPaths = Object.keys(hooksConfig);
 
   try {
     switch (hookFormat) {
-      case 'claude-code':
-        return removeClaudeCodeHooks(platformBase, scriptRelPaths);
+      case 'claude-code': {
+        const canonicalFile = platform.hookConfigFile ?? 'settings.local.json';
+        const files = [canonicalFile, ...(platform.legacyHookConfigFiles ?? [])];
+        let removed = 0;
+        let failed = 0;
+        for (const file of new Set(files)) {
+          let result: RemovalResult;
+          try {
+            result = await removeManagedHooksFromJsonFile(
+              path.join(platformBase, file),
+              scriptRelPaths,
+            );
+          } catch {
+            if (file === canonicalFile) failed++;
+            continue;
+          }
+          removed += result.removed;
+          if (file === canonicalFile) failed += result.failed;
+        }
+        return { removed, failed };
+      }
       case 'qwen':
       case 'qoder':
-        return removeQwenStyleHooks(platformBase, scriptRelPaths);
+      case 'codebuddy':
+        return await removeQwenStyleHooks(platformBase, scriptRelPaths);
       case 'gemini':
-        return removeGeminiHooks(platformBase, scriptRelPaths);
+        return await removeGeminiHooks(platformBase, scriptRelPaths);
       case 'windsurf':
-        return removeWindsurfHooks(platformBase, scriptRelPaths);
+        return await removeWindsurfHooks(platformBase, scriptRelPaths);
       case 'copilot':
-        return removeCopilotHooks(platformBase);
+        return await removeCopilotHooks(platformBase);
       case 'kiro':
-        return removeKiroHooks(platformBase, scriptRelPaths);
+        return await removeKiroHooks(platformBase, scriptRelPaths);
       default:
         return { removed: 0, failed: 0 };
     }
@@ -191,76 +291,17 @@ async function removeCometHooksForPlatform(
   }
 }
 
-async function removeClaudeCodeHooks(
-  platformBase: string,
-  scriptRelPaths: string[],
-): Promise<RemovalResult> {
-  const settingsPath = path.join(platformBase, 'settings.local.json');
-  if (!(await fileExists(settingsPath))) {
-    return { removed: 0, failed: 0 };
-  }
-
-  let removed = 0;
-  let settings: Record<string, unknown>;
-  try {
-    settings = JSON.parse(await readFile(settingsPath, 'utf-8')) as Record<string, unknown>;
-  } catch {
-    return { removed: 0, failed: 0 };
-  }
-
-  const existingHooks = settings.hooks as Record<string, unknown> | undefined;
-  if (!existingHooks) {
-    return { removed: 0, failed: 0 };
-  }
-
-  const existingPreToolUse = existingHooks.PreToolUse as Array<Record<string, unknown>> | undefined;
-  if (!existingPreToolUse || !Array.isArray(existingPreToolUse)) {
-    return { removed: 0, failed: 0 };
-  }
-
-  const filtered = existingPreToolUse.flatMap((group) => {
-    if (!Array.isArray(group.hooks)) return [group];
-
-    const hooksBefore = (group.hooks as Array<Record<string, unknown>>).length;
-    const hooks = (group.hooks as Array<Record<string, unknown>>).filter(
-      (hook) => !isManagedHookCommand(hook.command, scriptRelPaths),
-    );
-    removed += hooksBefore - hooks.length;
-
-    if (hooks.length === 0) return [];
-    return [{ ...group, hooks }];
-  });
-
-  if (filtered.length === 0) {
-    delete existingHooks.PreToolUse;
-  } else {
-    existingHooks.PreToolUse = filtered;
-  }
-
-  if (Object.keys(existingHooks).length === 0) {
-    delete settings.hooks;
-  }
-
-  await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
-  return { removed, failed: 0 };
-}
-
 async function removeQwenStyleHooks(
   platformBase: string,
   scriptRelPaths: string[],
 ): Promise<RemovalResult> {
   const settingsPath = path.join(platformBase, 'settings.json');
-  if (!(await fileExists(settingsPath))) {
-    return { removed: 0, failed: 0 };
-  }
-
+  if (!(await fileExists(settingsPath))) return { removed: 0, failed: 0 };
   let removed = 0;
-  let settings: Record<string, unknown>;
-  try {
-    settings = JSON.parse(await readFile(settingsPath, 'utf-8')) as Record<string, unknown>;
-  } catch {
-    return { removed: 0, failed: 0 };
-  }
+  const readResult = await readJsonObjectFile(settingsPath);
+  if (readResult.status === 'missing') return { removed: 0, failed: 0 };
+  if (readResult.status === 'error') return { removed: 0, failed: 1 };
+  const settings = readResult.value;
 
   const existingHooks = settings.hooks as Record<string, unknown> | undefined;
   if (!existingHooks) {
@@ -281,7 +322,10 @@ async function removeQwenStyleHooks(
     );
     removed += hooksBefore - hooks.length;
 
-    if (hooks.length === 0) return [];
+    const hasUnknownMetadata = Object.keys(group).some(
+      (key) => key !== 'matcher' && key !== 'hooks',
+    );
+    if (hooks.length === 0) return hasUnknownMetadata ? [{ ...group, hooks: [] }] : [];
     return [{ ...group, hooks }];
   });
 
@@ -304,17 +348,12 @@ async function removeGeminiHooks(
   scriptRelPaths: string[],
 ): Promise<RemovalResult> {
   const settingsPath = path.join(platformBase, 'settings.json');
-  if (!(await fileExists(settingsPath))) {
-    return { removed: 0, failed: 0 };
-  }
-
+  if (!(await fileExists(settingsPath))) return { removed: 0, failed: 0 };
   let removed = 0;
-  let settings: Record<string, unknown>;
-  try {
-    settings = JSON.parse(await readFile(settingsPath, 'utf-8')) as Record<string, unknown>;
-  } catch {
-    return { removed: 0, failed: 0 };
-  }
+  const readResult = await readJsonObjectFile(settingsPath);
+  if (readResult.status === 'missing') return { removed: 0, failed: 0 };
+  if (readResult.status === 'error') return { removed: 0, failed: 1 };
+  const settings = readResult.value;
 
   const existingHooks = settings.hooks as Record<string, unknown> | undefined;
   if (!existingHooks) {
@@ -335,7 +374,10 @@ async function removeGeminiHooks(
     );
     removed += hooksBefore - hooks.length;
 
-    if (hooks.length === 0) return [];
+    const hasUnknownMetadata = Object.keys(group).some(
+      (key) => key !== 'matcher' && key !== 'hooks',
+    );
+    if (hooks.length === 0) return hasUnknownMetadata ? [{ ...group, hooks: [] }] : [];
     return [{ ...group, hooks }];
   });
 
@@ -358,17 +400,12 @@ async function removeWindsurfHooks(
   scriptRelPaths: string[],
 ): Promise<RemovalResult> {
   const hooksPath = path.join(platformBase, 'hooks.json');
-  if (!(await fileExists(hooksPath))) {
-    return { removed: 0, failed: 0 };
-  }
-
+  if (!(await fileExists(hooksPath))) return { removed: 0, failed: 0 };
   let removed = 0;
-  let hooksFile: Record<string, unknown>;
-  try {
-    hooksFile = JSON.parse(await readFile(hooksPath, 'utf-8')) as Record<string, unknown>;
-  } catch {
-    return { removed: 0, failed: 0 };
-  }
+  const readResult = await readJsonObjectFile(hooksPath);
+  if (readResult.status === 'missing') return { removed: 0, failed: 0 };
+  if (readResult.status === 'error') return { removed: 0, failed: 1 };
+  const hooksFile = readResult.value;
 
   const existingHooks = hooksFile.hooks as Record<string, unknown> | undefined;
   if (!existingHooks) {
@@ -406,14 +443,24 @@ async function removeWindsurfHooks(
 
 async function removeCopilotHooks(platformBase: string): Promise<RemovalResult> {
   const hookFilePath = path.join(platformBase, 'hooks', 'comet-guard.json');
-  const removed = (await removeFile(hookFilePath)) ? 1 : 0;
-
-  const hooksDir = path.join(platformBase, 'hooks');
-  if (await isDirEmpty(hooksDir)) {
-    await removeDir(hooksDir);
+  let removed = 0;
+  let failed = 0;
+  try {
+    if (await removeFile(hookFilePath)) removed++;
+  } catch {
+    failed++;
   }
 
-  return { removed, failed: 0 };
+  const hooksDir = path.join(platformBase, 'hooks');
+  try {
+    if (await isDirEmpty(hooksDir)) {
+      await removeDir(hooksDir);
+    }
+  } catch {
+    failed++;
+  }
+
+  return { removed, failed };
 }
 
 async function removeKiroHooks(
@@ -421,11 +468,19 @@ async function removeKiroHooks(
   scriptRelPaths: string[],
 ): Promise<RemovalResult> {
   const hooksDir = path.join(platformBase, 'hooks');
-  if (!(await fileExists(hooksDir))) {
-    return { removed: 0, failed: 0 };
+  try {
+    if (!(await lstat(hooksDir)).isDirectory()) {
+      return { removed: 0, failed: 1 };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { removed: 0, failed: 0 };
+    }
+    return { removed: 0, failed: 1 };
   }
 
   let removed = 0;
+  let failed = 0;
   const entries = await readDir(hooksDir);
 
   for (const entry of entries) {
@@ -438,48 +493,77 @@ async function removeKiroHooks(
 
     if (isCometHook) {
       const hookPath = path.join(hooksDir, entry);
-      if (await removeFile(hookPath)) {
-        removed++;
+      try {
+        if (await removeFile(hookPath)) {
+          removed++;
+        }
+      } catch {
+        failed++;
       }
     }
   }
 
-  if (await isDirEmpty(hooksDir)) {
-    await removeDir(hooksDir);
+  try {
+    if (await isDirEmpty(hooksDir)) {
+      await removeDir(hooksDir);
+    }
+  } catch {
+    failed++;
   }
 
-  return { removed, failed: 0 };
+  return { removed, failed };
 }
 
 async function removeWorkingDirs(projectPath: string): Promise<RemovalResult> {
   let removed = 0;
+  let failed = 0;
 
   const cometDir = path.join(projectPath, '.comet');
-  if (await removeDir(cometDir)) {
-    removed++;
+  try {
+    if (await removeDir(cometDir)) {
+      removed++;
+    }
+  } catch {
+    failed++;
   }
 
   const specsDir = path.join(projectPath, 'docs', 'superpowers', 'specs');
-  if (await isDirEmpty(specsDir)) {
-    await removeDir(specsDir);
+  try {
+    if (await isDirEmpty(specsDir)) {
+      await removeDir(specsDir);
+    }
+  } catch {
+    failed++;
   }
 
   const plansDir = path.join(projectPath, 'docs', 'superpowers', 'plans');
-  if (await isDirEmpty(plansDir)) {
-    await removeDir(plansDir);
+  try {
+    if (await isDirEmpty(plansDir)) {
+      await removeDir(plansDir);
+    }
+  } catch {
+    failed++;
   }
 
   const superpowersDir = path.join(projectPath, 'docs', 'superpowers');
-  if (await isDirEmpty(superpowersDir)) {
-    await removeDir(superpowersDir);
+  try {
+    if (await isDirEmpty(superpowersDir)) {
+      await removeDir(superpowersDir);
+    }
+  } catch {
+    failed++;
   }
 
   const docsDir = path.join(projectPath, 'docs');
-  if (await isDirEmpty(docsDir)) {
-    await removeDir(docsDir);
+  try {
+    if (await isDirEmpty(docsDir)) {
+      await removeDir(docsDir);
+    }
+  } catch {
+    failed++;
   }
 
-  return { removed, failed: 0 };
+  return { removed, failed };
 }
 
 export {

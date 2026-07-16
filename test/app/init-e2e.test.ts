@@ -38,6 +38,10 @@ vi.mock('../../app/commands/migrate-docs.js', async (importOriginal) => ({
   migrateDocsCommand: vi.fn(),
 }));
 
+vi.mock('../../app/cli/comet-banner.js', () => ({
+  printCometBanner: vi.fn(async () => undefined),
+}));
+
 const manifestPath = path.resolve('assets', 'manifest.json');
 const INIT_E2E_TIMEOUT_MS = 60_000;
 
@@ -65,6 +69,9 @@ function mockExternalSuccess() {
 
     if ((cmd === 'which' || cmd === 'where') && cmdArgs[0] === 'openspec') {
       return Buffer.from('/usr/bin/openspec');
+    }
+    if (cmd === 'openspec' && cmdArgs[0] === '--version') {
+      return Buffer.from('1.5.0');
     }
     if (cmd === 'openspec' && cmdArgs[0] === 'init') {
       return Buffer.from('ok');
@@ -141,6 +148,43 @@ describe('comet init E2E', () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('enables the banner for text output and disables it for JSON output', async () => {
+    mockExternalSuccess();
+    await fs.mkdir(path.join(tmpDir, '.claude'), { recursive: true });
+    const { printCometBanner } = await import('../../app/cli/comet-banner.js');
+    const { initCommand } = await import('../../app/commands/init.js');
+
+    await captureTextOutput(() => initCommand(tmpDir, { yes: true, language: 'en' }));
+    expect(printCometBanner).toHaveBeenLastCalledWith({ enabled: true });
+
+    await captureJsonOutput(() => initCommand(tmpDir, { yes: true, json: true }));
+    expect(printCometBanner).toHaveBeenLastCalledWith({ enabled: false });
+  });
+
+  it('waits for the banner before printing version info', async () => {
+    mockExternalSuccess();
+    await fs.mkdir(path.join(tmpDir, '.claude'), { recursive: true });
+    let resolveBanner!: () => void;
+    const bannerDone = new Promise<void>((resolve) => {
+      resolveBanner = resolve;
+    });
+    const { printCometBanner } = await import('../../app/cli/comet-banner.js');
+    const { printVersionInfo } = await import('../../platform/version/version.js');
+    vi.mocked(printCometBanner).mockImplementationOnce(() => bannerDone);
+    const { initCommand } = await import('../../app/commands/init.js');
+
+    const initPromise = captureTextOutput(() => initCommand(tmpDir, { yes: true, language: 'en' }));
+    await vi.waitFor(() => expect(printCometBanner).toHaveBeenCalledWith({ enabled: true }));
+    expect(printVersionInfo).not.toHaveBeenCalled();
+
+    resolveBanner();
+    await initPromise;
+
+    expect(vi.mocked(printCometBanner).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(printVersionInfo).mock.invocationCallOrder[0],
+    );
   });
 
   it(
@@ -585,6 +629,9 @@ describe('comet init E2E', () => {
       expect(result.scope).toBe('global');
       expect(result.workingDirsCreated).toBe(false);
 
+      const config = await fs.readFile(path.join(fakeHome, '.comet', 'config.yaml'), 'utf-8');
+      expect(config).toContain('language: en');
+
       const manifest = await readManifest();
       for (const skillPath of manifest.skills) {
         const dest = path.join(fakeHome, '.claude', 'skills', skillPath);
@@ -639,7 +686,342 @@ describe('comet init E2E', () => {
   });
 
   it(
-    'skips already-installed Comet skills with --yes',
+    'installs Codex skills under .agents while keeping phase rules under .codex',
+    async () => {
+      mockExternalSuccess();
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+
+      const { initCommand } = await import('../../app/commands/init.js');
+      const result = await captureJsonOutput(() => initCommand(tmpDir, { yes: true, json: true }));
+
+      expect(result.selectedPlatforms).toEqual(['codex']);
+      await expect(
+        fs.access(path.join(tmpDir, '.agents', 'skills', 'comet', 'SKILL.md')),
+      ).resolves.toBeUndefined();
+      await expect(
+        fs.access(path.join(tmpDir, '.codex', 'skills', 'comet', 'SKILL.md')),
+      ).rejects.toThrow();
+
+      const ruleDest = path.join(tmpDir, '.codex', 'rules', 'comet-phase-guard.md');
+      await expect(fs.access(ruleDest)).resolves.toBeUndefined();
+      await expect(
+        fs.access(path.join(tmpDir, '.agents', 'rules', 'comet-phase-guard.md')),
+      ).rejects.toThrow();
+
+      const hooks = JSON.parse(
+        await fs.readFile(path.join(tmpDir, '.codex', 'hooks.json'), 'utf8'),
+      );
+      const hookCommand = hooks.hooks.PreToolUse[0].hooks[0].command as string;
+      expect(hookCommand.replaceAll('\\', '/')).toContain(
+        '/.agents/skills/comet/scripts/comet-hook-guard.mjs',
+      );
+      await expect(
+        fs.access(path.join(tmpDir, '.codex', 'settings.local.json')),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it(
+    'Skill failure skips dependent Rule and Hook installation and leaves init incomplete',
+    async () => {
+      mockExternalSuccess();
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+      const centralCometDir = path.join(tmpDir, '.comet', 'skills', 'skills', 'comet');
+      await fs.mkdir(centralCometDir, { recursive: true });
+      await fs.writeFile(path.join(centralCometDir, 'scripts'), 'blocking file');
+
+      const { initCommand } = await import('../../app/commands/init.js');
+      const output = await captureTextOutput(() =>
+        initCommand(tmpDir, { yes: true, language: 'en', installMode: 'symlink' }),
+      );
+
+      expect(output).toMatch(/Codex \(Comet failed\)/u);
+      await expect(
+        fs.access(path.join(tmpDir, '.codex', 'rules', 'comet-phase-guard.md')),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(fs.access(path.join(tmpDir, '.codex', 'hooks.json'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      await expect(
+        fs.access(getProjectRegistryPath(path.join(tmpDir, 'fake-home'))),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it(
+    'init --yes reuses an existing managed Skill and restores missing Codex Rule and Hook components',
+    async () => {
+      mockExternalSuccess();
+      const fakeHome = path.join(tmpDir, 'fake-home');
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+      const { initCommand } = await import('../../app/commands/init.js');
+
+      await captureJsonOutput(() => initCommand(tmpDir, { yes: true, json: true, language: 'en' }));
+      await fs.rm(path.join(tmpDir, '.codex', 'rules'), { recursive: true, force: true });
+      await fs.rm(path.join(tmpDir, '.codex', 'hooks.json'), { force: true });
+      await fs.rm(getProjectRegistryPath(fakeHome), { force: true });
+
+      const result = await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, language: 'en' }),
+      );
+      const codex = (result.results as Array<{ platform: string; comet: string }>).find(
+        (candidate) => candidate.platform === 'codex',
+      );
+
+      expect(codex?.comet).toBe('installed');
+      await expect(
+        fs.access(path.join(tmpDir, '.codex', 'rules', 'comet-phase-guard.md')),
+      ).resolves.toBeUndefined();
+      await expect(fs.access(path.join(tmpDir, '.codex', 'hooks.json'))).resolves.toBeUndefined();
+      const registry = JSON.parse(await fs.readFile(getProjectRegistryPath(fakeHome), 'utf8')) as {
+        projects: Array<{ lastTargets: Array<{ platform: string }> }>;
+      };
+      expect(registry.projects[0].lastTargets).toContainEqual(
+        expect.objectContaining({ platform: 'codex' }),
+      );
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it(
+    'init --yes project scope does not treat a global-only Skill as a complete local install',
+    async () => {
+      mockExternalSuccess();
+      const fakeHome = path.join(tmpDir, 'fake-home');
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+      const { initCommand } = await import('../../app/commands/init.js');
+
+      await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, language: 'en', scope: 'global' }),
+      );
+      await fs.mkdir(path.join(tmpDir, '.agents'), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, '.agents', 'skills'), 'blocking file', 'utf8');
+
+      const result = await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, language: 'en', scope: 'project' }),
+      );
+      const codex = (result.results as Array<{ platform: string; comet: string }>).find(
+        (candidate) => candidate.platform === 'codex',
+      );
+
+      expect(codex?.comet).toBe('failed');
+      await expect(fs.access(path.join(tmpDir, '.codex', 'hooks.json'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      await expect(fs.access(getProjectRegistryPath(fakeHome))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it(
+    'init --yes repairs a partial local Skill before restoring dependent Rule and Hook components',
+    async () => {
+      mockExternalSuccess();
+      const fakeHome = path.join(tmpDir, 'fake-home');
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+      const { initCommand } = await import('../../app/commands/init.js');
+      const guardScript = path.join(
+        tmpDir,
+        '.agents',
+        'skills',
+        'comet',
+        'scripts',
+        'comet-hook-guard.mjs',
+      );
+
+      await captureJsonOutput(() => initCommand(tmpDir, { yes: true, json: true, language: 'en' }));
+      await fs.rm(guardScript, { force: true });
+      await fs.rm(path.join(tmpDir, '.codex', 'rules'), { recursive: true, force: true });
+      await fs.rm(path.join(tmpDir, '.codex', 'hooks.json'), { force: true });
+      await fs.rm(getProjectRegistryPath(fakeHome), { force: true });
+
+      const result = await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, language: 'en' }),
+      );
+      const codex = (result.results as Array<{ platform: string; comet: string }>).find(
+        (candidate) => candidate.platform === 'codex',
+      );
+
+      expect(codex?.comet).toBe('installed');
+      await expect(fs.access(guardScript)).resolves.toBeUndefined();
+      await expect(fs.access(path.join(tmpDir, '.codex', 'hooks.json'))).resolves.toBeUndefined();
+      const registry = JSON.parse(await fs.readFile(getProjectRegistryPath(fakeHome), 'utf8')) as {
+        projects: Array<{ lastTargets: Array<{ platform: string }> }>;
+      };
+      expect(registry.projects[0].lastTargets).toContainEqual(
+        expect.objectContaining({ platform: 'codex' }),
+      );
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it(
+    'init --yes does not register reused Skills when canonical Hook validation fails',
+    async () => {
+      mockExternalSuccess();
+      const fakeHome = path.join(tmpDir, 'fake-home');
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+      const { initCommand } = await import('../../app/commands/init.js');
+
+      await captureJsonOutput(() => initCommand(tmpDir, { yes: true, json: true, language: 'en' }));
+      await fs.writeFile(path.join(tmpDir, '.codex', 'hooks.json'), '[]\n', 'utf8');
+      await fs.rm(getProjectRegistryPath(fakeHome), { force: true });
+
+      const result = await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, language: 'en' }),
+      );
+      const codex = (result.results as Array<{ platform: string; comet: string }>).find(
+        (candidate) => candidate.platform === 'codex',
+      );
+
+      expect(codex?.comet).toBe('failed');
+      let projects: unknown[] = [];
+      try {
+        projects = (
+          JSON.parse(await fs.readFile(getProjectRegistryPath(fakeHome), 'utf8')) as {
+            projects: unknown[];
+          }
+        ).projects;
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'ENOENT' });
+      }
+      expect(projects).toEqual([]);
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it(
+    'an explicit skip of existing Comet Skills does not register an incomplete target',
+    async () => {
+      mockExternalSuccess();
+      const fakeHome = path.join(tmpDir, 'fake-home');
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+      const { initCommand } = await import('../../app/commands/init.js');
+
+      await captureJsonOutput(() => initCommand(tmpDir, { yes: true, json: true, language: 'en' }));
+      await fs.rm(path.join(tmpDir, '.codex', 'rules'), { recursive: true, force: true });
+      await fs.rm(path.join(tmpDir, '.codex', 'hooks.json'), { force: true });
+      await fs.rm(getProjectRegistryPath(fakeHome), { force: true });
+
+      await captureJsonOutput(() =>
+        initCommand(tmpDir, {
+          yes: true,
+          json: true,
+          language: 'en',
+          skipExisting: true,
+        }),
+      );
+
+      let projects: unknown[] = [];
+      try {
+        projects = (
+          JSON.parse(await fs.readFile(getProjectRegistryPath(fakeHome), 'utf8')) as {
+            projects: unknown[];
+          }
+        ).projects;
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'ENOENT' });
+      }
+      expect(projects).toEqual([]);
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it.each([
+    { component: 'Rule', outcome: 'returned' },
+    { component: 'Rule', outcome: 'thrown' },
+    { component: 'Hook', outcome: 'returned' },
+    { component: 'Hook', outcome: 'thrown' },
+  ] as const)(
+    '$component $outcome failure makes init Comet failed and prevents registry success',
+    async ({ component, outcome }) => {
+      mockExternalSuccess();
+      await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+      const platformInstall = await import('../../domains/skill/platform-install.js');
+
+      if (component === 'Rule') {
+        const ruleSpy = vi.spyOn(platformInstall, 'copyCometRulesForPlatform');
+        if (outcome === 'returned') {
+          ruleSpy.mockResolvedValueOnce({ copied: 0, skipped: 0, failed: 1 });
+        } else {
+          ruleSpy.mockRejectedValueOnce(new Error('rule install threw'));
+        }
+      } else {
+        const hookSpy = vi.spyOn(platformInstall, 'installCometHooksForPlatform');
+        if (outcome === 'returned') {
+          hookSpy.mockResolvedValueOnce({
+            status: 'failed',
+            reason: 'hook install returned failed',
+          });
+        } else {
+          hookSpy.mockRejectedValueOnce(new Error('hook install threw'));
+        }
+      }
+
+      const { initCommand } = await import('../../app/commands/init.js');
+      const result = await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, json: true, language: 'en' }),
+      );
+      const codexResult = (result.results as { platform: string; comet: string }[]).find(
+        (candidate) => candidate.platform === 'codex',
+      );
+
+      expect(codexResult?.comet).toBe('failed');
+      await expect(
+        fs.access(getProjectRegistryPath(path.join(tmpDir, 'fake-home'))),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+    INIT_E2E_TIMEOUT_MS,
+  );
+
+  it('records project-scope Comet installs in the user project registry', async () => {
+    const fakeHome = path.join(tmpDir, 'fake-home');
+    await fs.mkdir(fakeHome, { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+
+    try {
+      const { initCommand } = await import('../../app/commands/init.js');
+      await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, scope: 'project', json: true, language: 'en' }),
+      );
+    } finally {
+      homedirSpy.mockRestore();
+    }
+
+    const registry = JSON.parse(await fs.readFile(getProjectRegistryPath(fakeHome), 'utf-8'));
+    expect(registry.projects).toHaveLength(1);
+    expect(registry.projects[0]).toMatchObject({
+      path: path.resolve(tmpDir),
+      lastSource: 'init',
+    });
+    expect(registry.projects[0].lastTargets.length).toBeGreaterThan(0);
+  });
+
+  it('does not record global-scope installs in the user project registry', async () => {
+    const fakeHome = path.join(tmpDir, 'fake-home-global');
+    await fs.mkdir(fakeHome, { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+
+    try {
+      const { initCommand } = await import('../../app/commands/init.js');
+      await captureJsonOutput(() =>
+        initCommand(tmpDir, { yes: true, scope: 'global', json: true, language: 'en' }),
+      );
+    } finally {
+      homedirSpy.mockRestore();
+    }
+
+    await expect(fs.access(getProjectRegistryPath(fakeHome))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it(
+    'reuses already-installed Comet skills with --yes and validates lifecycle components',
     async () => {
       mockExternalSuccess();
       await fs.mkdir(path.join(tmpDir, '.claude'), { recursive: true });
@@ -661,7 +1043,7 @@ describe('comet init E2E', () => {
       const claude2 = (result2.results as { platform: string; comet: string }[]).find(
         (r) => r.platform === 'claude',
       );
-      expect(claude2?.comet).toBe('skipped');
+      expect(claude2?.comet).toBe('installed');
     },
     INIT_E2E_TIMEOUT_MS,
   );
@@ -713,7 +1095,6 @@ describe('comet init E2E', () => {
         const platformDirs = [
           '.claude',
           '.cursor',
-          '.codex',
           '.opencode',
           '.windsurf',
           '.cline',
@@ -750,6 +1131,10 @@ describe('comet init E2E', () => {
             await expect(fs.access(dest)).resolves.toBeUndefined();
           }
         }
+
+        await expect(
+          fs.access(path.join(tmpDir, '.codex', 'skills', 'comet', 'SKILL.md')),
+        ).rejects.toThrow();
 
         await expect(
           fs.access(path.join(tmpDir, '.opencode', 'commands', 'comet-open.md')),
@@ -1031,6 +1416,9 @@ describe('comet init E2E', () => {
       );
 
       expect(result.selectedPlatforms).toEqual(['zcode']);
+
+      const config = await fs.readFile(path.join(fakeHome, '.comet', 'config.yaml'), 'utf-8');
+      expect(config).toContain('language: zh-CN');
 
       // With zh selected, only the normalized zh rule file should be installed —
       // the .en.md variant must not appear alongside it.

@@ -20,6 +20,7 @@ import {
   copyCometRulesForPlatform,
   installCometHooksForPlatform,
   createWorkingDirs,
+  mergeProjectConfig,
 } from '../../domains/skill/platform-install.js';
 import type { ArtifactLayoutOption } from '../../domains/skill/platform-install.js';
 import { LANGUAGES, type LanguageConfig } from '../../domains/skill/languages.js';
@@ -37,6 +38,7 @@ import {
   resolveCodegraphCommand,
 } from '../../domains/integrations/codegraph.js';
 import { printVersionInfo } from '../../platform/version/version.js';
+import { printCometBanner } from '../cli/comet-banner.js';
 import { t, type TranslationKey } from './i18n.js';
 import { detectInstalledCometTargets } from './update.js';
 import { resolveCometArtifactLayout } from '../../domains/comet-classic/classic-artifact-layout.js';
@@ -56,7 +58,7 @@ type InitOptions = {
 };
 
 type InstallStatus = 'installed' | 'skipped' | 'failed';
-type ComponentAction = 'overwrite' | 'skip' | 'install';
+type ComponentAction = 'overwrite' | 'skip' | 'install' | 'reuse';
 type BulkOverwriteChoice = 'overwrite-all' | 'skip-all' | 'choose';
 
 interface PlatformResult {
@@ -80,18 +82,6 @@ function validateArtifactOptions(options: InitOptions): void {
     );
   }
 }
-
-const COMET_BANNER = [
-  `   ██████╗ ██████╗ ███╗   ███╗███████╗████████╗`,
-  `  ██╔════╝██╔═══██╗████╗ ████║██╔════╝╚══██╔══╝`,
-  `  ██║     ██║   ██║██╔████╔██║█████╗     ██║   `,
-  `  ██║     ██║   ██║██║╚██╔╝██║██╔══╝     ██║   `,
-  `  ╚██████╗╚██████╔╝██║ ╚═╝ ██║███████╗   ██║   `,
-  `   ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝   ╚═╝   `,
-  `       Agent Skill Harness Phase-Guarded Automation`,
-  `               From Idea To Archive                `,
-].join('\n');
-
 async function selectScope(options: InitOptions, lang: string): Promise<InstallScope> {
   if (options.scope) return options.scope;
   if (options.yes) return 'project';
@@ -213,6 +203,11 @@ function resolveAction(
   if (options.skipExisting) return 'skip';
   if (options.yes) return 'skip';
   return 'install';
+}
+
+function resolveCometAction(hasExisting: boolean, options: InitOptions): ComponentAction {
+  if (hasExisting && options.yes && !options.overwrite && !options.skipExisting) return 'reuse';
+  return resolveAction(hasExisting, options);
 }
 
 type NpmDepId = 'openspec' | 'superpowers' | 'codegraph';
@@ -360,7 +355,7 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
   const projectPath = path.resolve(targetPath);
   const log = options.json ? () => undefined : console.log;
 
-  log(`\n${COMET_BANNER}\n`);
+  await printCometBanner({ enabled: !options.json });
   if (!options.json) {
     await printVersionInfo(log);
   }
@@ -469,7 +464,7 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
 
     let osAction = resolveAction(hasOS, options);
     let spAction = resolveAction(hasSP, options);
-    let cmAction = resolveAction(hasCM, options);
+    let cmAction = resolveCometAction(hasCM, options);
 
     if (!options.yes) {
       const existingComponents = [
@@ -577,6 +572,8 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
         : `${scope === 'global' ? '~/' : ''}${platformSkillsDir}/skills/`;
 
     let cmStatus: InstallStatus = 'skipped';
+    let cometComponentInstalled = false;
+    let skillFailed = false;
     if (cmAction !== 'skip') {
       const { copied, failed } = await copyCometSkillsForPlatform(
         baseDir,
@@ -586,36 +583,69 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
         scope,
         installMode,
       );
+      skillFailed = failed > 0;
       cmStatus = failed > 0 ? 'failed' : copied > 0 ? 'installed' : 'skipped';
-      log(
-        `  Comet -> ${platform.name}: ${cmStatus} (${copied} files${
-          failed > 0 ? `, ${failed} failed` : ''
-        }) -> ${skillsPath}`,
-      );
+      cometComponentInstalled = copied > 0;
+      if (cmAction === 'reuse' && copied === 0 && failed === 0) {
+        log(`  Comet -> ${platform.name}: reused (${t(lang, 'alreadyExists')})`);
+      } else {
+        log(
+          `  Comet -> ${platform.name}: ${cmStatus} (${copied} files${
+            failed > 0 ? `, ${failed} failed` : ''
+          }) -> ${skillsPath}`,
+        );
+      }
     } else {
       log(`  Comet -> ${platform.name}: skipped (${t(lang, 'alreadyExists')})`);
     }
 
-    if (cmAction !== 'skip') {
-      const { copied: ruleCopied } = await copyCometRulesForPlatform(
-        baseDir,
-        platform,
-        cmAction === 'overwrite',
-        language.id,
-        scope,
-      );
-      if (ruleCopied > 0) {
-        log(`  Comet rules -> ${platform.name}: ${ruleCopied} ${t(lang, 'rulesInstalled')}`);
+    if (cmAction !== 'skip' && !skillFailed) {
+      try {
+        const { copied: ruleCopied, failed: ruleFailed } = await copyCometRulesForPlatform(
+          baseDir,
+          platform,
+          cmAction === 'overwrite',
+          language.id,
+          scope,
+        );
+        cometComponentInstalled ||= ruleCopied > 0;
+        if (ruleCopied > 0) {
+          log(`  Comet rules -> ${platform.name}: ${ruleCopied} ${t(lang, 'rulesInstalled')}`);
+        }
+        if (ruleFailed > 0) {
+          cmStatus = 'failed';
+          log(`  Comet rules -> ${platform.name}: ${t(lang, 'rulesFailed')} (${ruleFailed})`);
+        }
+      } catch (err) {
+        cmStatus = 'failed';
+        log(
+          `  Comet rules -> ${platform.name}: ${t(lang, 'rulesFailed')} (${(err as Error).message})`,
+        );
       }
     }
 
-    if (cmAction !== 'skip' && platform.supportsHooks) {
-      const { installed, reason } = await installCometHooksForPlatform(baseDir, platform, scope);
-      if (installed) {
-        log(`  Comet hooks -> ${platform.name}: ${t(lang, 'hooksInstalled')}`);
-      } else if (reason) {
-        log(`  Comet hooks -> ${platform.name}: ${t(lang, 'hooksSkipped')} (${reason})`);
+    if (cmAction !== 'skip' && !skillFailed) {
+      try {
+        const { status, reason } = await installCometHooksForPlatform(baseDir, platform, scope);
+        cometComponentInstalled ||= status === 'installed';
+        if (status === 'installed') {
+          log(`  Comet hooks -> ${platform.name}: ${t(lang, 'hooksInstalled')}`);
+        } else if (status === 'failed') {
+          cmStatus = 'failed';
+          log(`  Comet hooks -> ${platform.name}: ${t(lang, 'hooksFailed')} (${reason})`);
+        } else if (reason && platform.supportsHooks) {
+          log(`  Comet hooks -> ${platform.name}: ${t(lang, 'hooksSkipped')} (${reason})`);
+        }
+      } catch (err) {
+        cmStatus = 'failed';
+        log(
+          `  Comet hooks -> ${platform.name}: ${t(lang, 'hooksFailed')} (${(err as Error).message})`,
+        );
       }
+    }
+
+    if (cmAction !== 'skip' && cmStatus !== 'failed') {
+      cmStatus = cometComponentInstalled ? 'installed' : 'skipped';
     }
 
     results.push({
@@ -673,16 +703,32 @@ export async function initCommand(targetPath: string, options: InitOptions = {})
       });
     }
     const projectTargets = await detectInstalledCometTargets(projectPath, { scopes: ['project'] });
-    if (projectTargets.length > 0) {
+    const successfulCometPlatforms = new Set(
+      results
+        .filter(
+          (result) =>
+            result.comet !== 'failed' &&
+            plans.some(
+              (plan) => plan.platform.id === result.platform.id && plan.cmAction !== 'skip',
+            ),
+        )
+        .map((result) => result.platform.id),
+    );
+    const completeProjectTargets = projectTargets.filter((target) =>
+      successfulCometPlatforms.has(target.platform.id),
+    );
+    if (completeProjectTargets.length > 0) {
       await upsertProjectInstallation(
         projectPath,
-        projectTargets.map((target) => ({
+        completeProjectTargets.map((target) => ({
           platform: target.platform.id,
           language: target.language,
         })),
         'init',
       );
     }
+  } else {
+    await mergeProjectConfig(baseDir, language.artifactLanguage);
   }
 
   if (options.json) {

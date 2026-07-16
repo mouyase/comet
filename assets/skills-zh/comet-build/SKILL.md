@@ -1,6 +1,6 @@
 ---
 name: comet-build
-description: "Use when full Comet change 已完成 design 阶段，需要创建/恢复实施计划、选择执行方式或继续 build 阶段任务。"
+description: "仅在用户明确调用 /comet-build，或由 Comet 根 Skill/runtime 路由到 full workflow 的 build 阶段时使用；创建或恢复实施计划并执行任务。"
 ---
 
 # Comet 阶段 3：计划与构建（Build）
@@ -14,25 +14,26 @@ description: "Use when full Comet change 已完成 design 阶段，需要创建/
 
 ### 0. 入口状态验证（Entry Check）
 
-按 `comet/reference/scripts.md` 定位脚本（定位 `comet-env.mjs`），然后执行入口验证；从任意入口恢复时先按 `comet/reference/context-recovery.md` 运行恢复检查：
+按 `comet/reference/scripts.md` 使用稳定 `comet` CLI，然后执行入口验证；从任意入口恢复时先按 `comet/reference/context-recovery.md` 运行恢复检查：
 
 ```bash
-node "$COMET_STATE" check <name> build
+comet state select <change-name>
+comet state check <name> build
 ```
 
 验证通过后继续 Step 1。验证失败时脚本会输出具体失败原因。
 
-**幂等性**：build 阶段所有操作可安全重复执行。读取 `.comet.yaml` 的 `phase` 字段确认仍在 build 阶段，读取 plan 文件头的 `base-ref`，再用 `grep -n '\- \[ \]' tasks.md | head -1` 找到第一个未勾选任务继续执行。已提交的任务不得重复提交。
+**幂等性**：build 阶段所有操作可安全重复执行。读取 `.comet.yaml` 的 `phase` 字段确认仍在 build 阶段，读取 plan 文件头的 `base-ref`，再按文档顺序解析 tasks.md 的复选框，从第一个未勾选任务继续执行。已提交的任务不得重复提交。
 
 ### 1. 制定计划（Subagent Offload）
 
-通过 subagent 创建实施计划，避免 planning skill 占用主 session 上下文。计划文件和执行反馈必须使用 `"$COMET_BASH" "$COMET_STATE" get <name> language` 读取到的 Comet 配置产物语言。
+通过 subagent 创建实施计划，避免 planning skill 占用主 session 上下文。计划文件和执行反馈必须使用 `comet state get <name> language` 读取到的 Comet 配置产物语言。
 
 **Subagent 指令**：
 
 你是实施计划专家。基于以下输入创建实施计划：
 
-1. **立即执行：** 使用 Skill 工具加载 Superpowers `writing-plans` 技能。禁止跳过此步骤。技能加载后，ARGUMENTS 必须包含：`Language: 使用 "$COMET_BASH" "$COMET_STATE" get <name> language 读取到的 Comet 配置产物语言输出`
+1. **立即执行：** 使用 Skill 工具加载 Superpowers `writing-plans` 技能。禁止跳过此步骤。技能加载后，ARGUMENTS 必须包含：`Language: 使用 comet state get <name> language 读取到的 Comet 配置产物语言输出`
 2. 读取 Design Doc（`docs/superpowers/specs/` 下的技术设计文档）
 3. 先运行 `comet openspec status --change "<name>" --json` 确认 `<openspec-change-dir>`，再读取 `<openspec-change-dir>/tasks.md`（任务边界）
 4. 按技能指引创建计划
@@ -64,50 +65,52 @@ Subagent 完成后：
 - 若返回有效文件路径且文件存在，记录为 plan
 - 若 subagent 失败或返回路径无效，在主 session 内联加载 Superpowers `writing-plans` 技能创建计划（降级回退）
 
-### 2. 更新计划状态并提供 plan-ready 暂停点
+### 2. 更新计划状态并联合确认工作方式
 
 先记录 plan 路径：
 
 ```bash
-node "$COMET_STATE" set <name> plan docs/superpowers/plans/YYYY-MM-DD-feature.md
+comet state set <name> plan docs/superpowers/plans/YYYY-MM-DD-feature.md
 ```
 
 无需手动更新 phase，阶段守卫（guard `--apply`）会在退出条件满足后推进 `phase` 字段。
 
-计划写入后，立即提供一个新的用户决策点：
+展示联合决策前先检查当前平台能力：确认 `using-git-worktrees` 是否可用、是否存在真实后台 subagent/Task/multi-agent 调度能力，以及当前仓库能否安全创建分支。只展示当前真实可执行的隔离与执行选项；某个字段只剩一个合法值时说明原因并直接采用，不为单选项制造额外停顿。
+
+计划写入后只提供**一个联合决策点**，一次收集：是否现在继续、可用的工作区隔离、可用的执行方式、TDD 模式和代码审查模式。选择 `branch` 时，分支名也必须在 Step 2 的同一个联合决策中确认或由用户覆盖。不得先询问“继续/暂停”，继续后又创建第二个配置或命名阻塞点。
 
 | 选项 | 行为 | 说明 |
 |------|------|------|
-| A | 继续执行 | 保持在当前模型中，进入 Step 3 选择工作区隔离、执行方式、TDD 模式和代码审查模式 |
+| A | 继续执行并提交配置 | 在同一次回复中选择 Step 3 的隔离、执行、TDD 和审查配置；如选择 branch，同时提交分支名 |
 | B | 暂停切换模型 | 记录 `build_pause: plan-ready`，本次 `/comet-build` 停止，用户稍后可从 `/comet` 或 `/comet-build` 恢复 |
 
-这是用户决策点。**必须按 `comet/reference/decision-point.md` 的协议暂停并等待用户明确选择**，不得自动继续，也不得把暂停写入 `build_mode`。
+这是用户决策点。**必须按 `comet/reference/decision-point.md` 的协议一次性展示计划摘要、暂停选项和 Step 3 全部可执行配置**。用户选择继续时，必须在同一回复中给出所有配置以及条件性的分支名；不得自动选择，也不得把暂停写入 `build_mode`。
 
-用户选择继续时：
+用户选择继续并给出完整配置时：
 
 ```bash
-node "$COMET_STATE" set <name> build_pause null
+comet state set <name> build_pause null
 ```
 
 用户选择暂停时：
 
 ```bash
-node "$COMET_STATE" set <name> build_pause plan-ready
+comet state set <name> build_pause plan-ready
 ```
 
 设置 `build_pause: plan-ready` 后，当前调用停止。不要选择 `isolation` 或 `build_mode`，不要加载执行技能。
 
-### 3. 选择工作方式
+### 3. 应用已确认的工作方式
 
-如果恢复时检测到 `build_pause: plan-ready` 且 `plan` 文件存在，不要重新运行 `writing-plans`。先告知用户当前停在 plan-ready 暂停点；用户确认继续后，设置：
+如果恢复时检测到 `build_pause: plan-ready` 且 `plan` 文件存在，不要重新运行 `writing-plans`。重新发起 Step 2 的同一个联合决策；只有用户同时给出完整配置后才清除暂停：
 
 ```bash
-node "$COMET_STATE" set <name> build_pause null
+comet state set <name> build_pause null
 ```
 
-然后继续本步骤选择工作区隔离、执行方式、TDD 模式和代码审查模式。
+然后应用本步骤中的工作区隔离、执行方式、TDD 模式和代码审查模式。
 
-计划已写入当前分支。在开始执行前，**一次性询问用户**选择工作区隔离方式、执行方式、TDD 模式和代码审查模式：
+计划已写入当前分支。以下配置必须由 Step 2 的联合决策一次性确认：
 
 **工作区隔离**：
 
@@ -132,26 +135,26 @@ node "$COMET_STATE" set <name> build_pause null
 - 任务数 ≤ 2 且无跨模块依赖 → 推荐 B
 - 来自 hotfix 路径 → 推荐 B
 
-这是用户决策点。**必须按 `comet/reference/decision-point.md` 的协议暂停并等待用户明确选择隔离方式、执行方式、TDD 模式和代码审查模式**，不得根据推荐规则自行选择 `branch` 或 `worktree`，也不得根据推荐规则自行选择执行方式、TDD 模式或代码审查模式。推荐规则只能用于说明建议，不能替代用户确认。
+这些表格是 Step 2 联合决策的一部分，不再单独暂停。先移除能力预检判定为不可执行的选项；在剩余多个合法选项时，不得根据推荐规则自行选择 `branch` 或 `worktree`，也不得自行选择执行方式、TDD 模式或代码审查模式。推荐规则只能用于说明建议，不能替代用户确认。
 
 用户选择后，更新 `isolation`、执行方式、TDD 模式和代码审查模式相关字段：
 
 ```bash
-node "$COMET_STATE" set <name> isolation <branch|worktree>
+comet state set <name> isolation <branch|worktree>
 ```
 
-- 若用户选择 `executing-plans`：运行 `node "$COMET_STATE" set <name> subagent_dispatch null`，再运行 `node "$COMET_STATE" set <name> build_mode executing-plans`
-- 若用户选择 `subagent-driven-development`：先确认当前平台存在可调用的真实后台 subagent / Task / multi-agent 调度能力；确认后先运行 `node "$COMET_STATE" set <name> subagent_dispatch confirmed`，再运行 `node "$COMET_STATE" set <name> build_mode subagent-driven-development`
-- 若无法确认真实后台调度能力，不得写入 `build_mode: subagent-driven-development`；必须暂停等待用户改选 `executing-plans`
+- 若用户选择 `executing-plans`：运行 `comet state set <name> subagent_dispatch null`，再运行 `comet state set <name> build_mode executing-plans`
+- 若用户选择 `subagent-driven-development`：先确认当前平台存在可调用的真实后台 subagent / Task / multi-agent 调度能力；确认后先运行 `comet state set <name> subagent_dispatch confirmed`，再运行 `comet state set <name> build_mode subagent-driven-development`
+- 若无法确认真实后台调度能力，不得展示或写入 `build_mode: subagent-driven-development`。恢复状态若已记录该模式但能力不可用，回到 Step 2 的同一个联合决策并只展示可执行模式；不得另设“改选 executing-plans”停顿点
 
 **TDD 模式**：
 
 | 选项 | 含义 | 适用场景 |
 |------|------|---------|
 | `tdd` | 每个任务先写失败测试再写实现 | 推荐。变更涉及业务逻辑、新功能、API |
-| `direct` | 直接实现，不强制 TDD 流程 | 变更不需要测试覆盖，或用户选择跳过测试直接写代码。hotfix/tweak 预设默认使用 `direct` |
+| `direct` | 实现优先，不强制逐任务 Red-Green-Refactor | 仍需运行相关测试并为 bug 修复保留回归证据；hotfix/tweak 预设默认使用 `direct` |
 
-运行 `node "$COMET_STATE" set <name> tdd_mode <tdd|direct>`
+运行 `comet state set <name> tdd_mode <tdd|direct>`
 
 **代码审查模式**：
 
@@ -161,39 +164,39 @@ node "$COMET_STATE" set <name> isolation <branch|worktree>
 | `standard` | 默认不为每任务派发 reviewer，仅当任务命中风险信号时派发每任务 reviewer，外加一次最终轻量代码审查 | 默认推荐，适合大多数普通改动 |
 | `thorough` | 为每个任务派发每任务 reviewer（spec + quality），外加一次最终完整审查 | 高风险、多模块、架构或安全相关改动 |
 
-运行 `node "$COMET_STATE" set <name> review_mode <off|standard|thorough>`
+运行 `comet state set <name> review_mode <off|standard|thorough>`
 
-`isolation` 是脚本级硬约束。full workflow 初始化时可以为 `null`，但只允许存在到本步骤之前。若保持 `null`，`build → verify` 的 guard 和 `comet-state transition build-complete` 都会失败。
+`isolation` 是脚本级硬约束。full workflow 初始化时可以为 `null`，但只允许存在到本步骤之前。若保持 `null`，`build → verify` 的 guard 和 `comet state transition build-complete` 都会失败。
 
-`subagent_dispatch` 是脚本级硬约束。`build_mode: subagent-driven-development` 离开 build 阶段前必须同时满足 `subagent_dispatch: confirmed`，否则 `comet-guard.mjs build --apply` 和 `comet-state transition build-complete` 都会失败。
+`subagent_dispatch` 是脚本级硬约束。`build_mode: subagent-driven-development` 离开 build 阶段前必须同时满足 `subagent_dispatch: confirmed`，否则 `comet guard build --apply` 和 `comet state transition build-complete` 都会失败。
 
-`tdd_mode` 是脚本级硬约束。full workflow 离开 build 阶段前 `tdd_mode` 必须已选择为 `tdd` 或 `direct`，否则 `comet-guard.mjs build --apply` 和 `comet-state transition build-complete` 都会失败。
+`tdd_mode` 是脚本级硬约束。full workflow 离开 build 阶段前 `tdd_mode` 必须已选择为 `tdd` 或 `direct`，否则 `comet guard build --apply` 和 `comet state transition build-complete` 都会失败。
 
-`review_mode` 是脚本级硬约束。新建 full workflow 离开 build 阶段前 `review_mode` 必须已选择为 `off`、`standard` 或 `thorough`，否则 `comet-guard.mjs build --apply` 和 `comet-state transition build-complete` 都会失败。旧状态文件若没有该字段，按兼容路径继续，但恢复时应补写该字段。
+`review_mode` 是脚本级硬约束。新建 full workflow 离开 build 阶段前 `review_mode` 必须已选择为 `off`、`standard` 或 `thorough`，否则 `comet guard build --apply` 和 `comet state transition build-complete` 都会失败。旧状态文件若没有该字段，按兼容路径继续，但恢复时应补写该字段。
 
 `build_mode` 默认仅 hotfix/tweak 预设使用 `direct`。full workflow 不得默认使用 `direct`。只有用户明确要求跳过计划执行技能，且你已记录显式 override 时，才允许：
 
 ```bash
-node "$COMET_STATE" set <name> direct_override true
-node "$COMET_STATE" set <name> build_mode direct
+comet state set <name> direct_override true
+comet state set <name> build_mode direct
 ```
 
 没有 `direct_override: true` 时，full workflow 的 `build_mode=direct` 会被 guard 和状态转换同时拦截。
 
 **执行隔离**：
 
-- **branch**：根据 workflow 类型和当前日期推荐分支名，然后让用户确认或输入自定义名称。这是用户决策点——**必须使用当前平台可用的用户输入/确认机制暂停并等待用户明确确认或覆盖分支名**，不得跳过此步骤直接创建分支。
+- **branch**：使用 Step 2 已确认的分支名，不得再次暂停。若旧状态恢复时缺少该次联合决策中的分支名，重新进入 Step 2 的同一个联合决策；不得创建第二个独立分支命名决策点。
 
   分支命名规范：
   - 读取 `.comet.yaml` 的 `workflow` 字段确定前缀
   - `workflow: full` → 推荐 `feature/YYYYMMDD/<change-name>`
   - `workflow: hotfix` → 推荐 `hotfix/YYYYMMDD/<change-name>`
   - `workflow: tweak` → 推荐 `tweak/YYYYMMDD/<change-name>`
-  - 日期取运行时 `date +%Y%m%d` 的结果
+  - 日期取当前运行环境日期并格式化为 `YYYYMMDD`，不得依赖某一种 shell 的日期命令
 
   示例：如果 change 名称为 `fix-login-bug`，今天是 2026-06-09，则推荐 `feature/20260609/fix-login-bug`
 
-  用户确认或提供自定义分支名后，执行 `git checkout -b <branch-name>`，后续工作在新分支上进行。
+  分支名由 Step 2 确认后，立即执行 `git checkout -b <branch-name>`，后续工作在新分支上进行。
 
 - **worktree**：必须使用 Skill 工具加载 Superpowers `using-git-worktrees` 技能创建隔离工作区。禁止用普通 shell 命令或原生工具绕过该技能；如该技能不可用，停止流程并提示安装或启用 Superpowers 技能。
 
@@ -204,11 +207,19 @@ git add docs/superpowers/plans/YYYY-MM-DD-feature.md
 git commit -m "chore: add implementation plan"
 ```
 
+进入最终执行分支或 worktree 后，必须在该实际工作区重新绑定当前 change。branch 切换会使入口绑定失效，新 worktree 也不会继承原工作区的本地选择文件：
+
+```bash
+comet state select <change-name>
+```
+
+重新绑定成功后才能开始源码写入。
+
 **执行计划**：必须按 `build_mode` 的真实运行位置处理。
 
-- `build_mode: executing-plans`：**立即执行：** 使用 Skill 工具加载 Superpowers `executing-plans` 技能。禁止跳过此步骤。若该技能不可用，停止流程并提示安装或启用对应技能，不要用普通对话替代该步骤。技能加载后，ARGUMENTS 必须包含与 Step 1 相同的 Language 约束：`Language: 使用 "$COMET_BASH" "$COMET_STATE" get <name> language 读取到的 Comet 配置产物语言输出`。按计划执行。
+- `build_mode: executing-plans`：**立即执行：** 使用 Skill 工具加载 Superpowers `executing-plans` 技能。禁止跳过此步骤。若该技能不可用，停止流程并提示安装或启用对应技能，不要用普通对话替代该步骤。技能加载后，ARGUMENTS 必须包含与 Step 1 相同的 Language 约束：`Language: 使用 comet state get <name> language 读取到的 Comet 配置产物语言输出`。按计划执行。
 - `build_mode: subagent-driven-development`：主会话只负责协调，禁止直接编写实现代码。**立即执行：** 使用 Skill 工具加载 Superpowers `subagent-driven-development` 技能。技能加载后，读取 `comet/reference/subagent-dispatch.md` 获取 Comet 专属扩展（真实后台调度、任务隔离、勾选验证、TDD 约束、连续执行、上下文恢复），与技能工作流配合应用。若两者发生冲突，以更具体的 Comet 扩展为准。
-- 如果当前平台没有真实后台 agent 调度能力，必须暂停并等待用户选择改用主窗口执行。用户选择改用主窗口执行后，必须先运行 `node "$COMET_STATE" set <name> build_mode executing-plans`，再按 `build_mode: executing-plans` 分支加载 Superpowers `executing-plans` 技能。用户未明确选择前，不得继续执行任务。
+- 如果执行前复检发现后台调度能力已失效，不得直接在主窗口执行，也不得创建新的二次决策；返回 Step 2 的同一个联合决策，移除不可用模式。用户在该联合决策中选择主窗口执行后，先运行 `comet state set <name> build_mode executing-plans`，再按对应分支继续。
 
 **TDD 模式执行约束**：
 
@@ -227,8 +238,8 @@ git commit -m "chore: add implementation plan"
 - **`review_mode: thorough`**：除最终那次审查外，按任务分段每 3 个任务请求一次分段代码审查（范围限于该段的 diff）。若总任务数 ≤ 3，跳过执行中分段，只做最终审查。每次分段审查用 `requesting-code-review` 针对该段的提交区间进行。这是 `executing-plans` 下最接近 `subagent-driven-development` 每任务审查的等价物，因为它没有隔离的 implementer 可供逐任务审查。
 
 要求（适用于 `standard` 和 `thorough`）：
-- `requesting-code-review` 技能必须在 `node "$COMET_GUARD" <change-name> build --apply` 之前加载
-- 若 `requesting-code-review` 技能不可用，跳过 review gate 但必须在 tasks.md 中记录 `<!-- review skipped: skill unavailable -->`，并继续 guard 流转
+- `requesting-code-review` 技能必须在 `comet guard <change-name> build --apply` 之前加载
+- 若 `requesting-code-review` 技能不可用且当前为 `standard` 或 `thorough`，必须停止并请用户选择：安装/启用后重试，或明确切换为 `review_mode: off` 并记录原因。用户未明确切换前不得跳过 review gate 或继续 guard
 - CRITICAL review 发现（安全漏洞、数据丢失风险、构建/测试失败）必须先修复，不得带入 verify
 - 非 CRITICAL review 发现如选择接受，必须在 tasks.md、commit body、验证报告草稿或其他持久产物中记录接受原因和影响范围
 
@@ -266,7 +277,7 @@ git commit -m "chore: add implementation plan"
 
 Build 是最长阶段，可能跨越大量任务。为支持上下文压缩后断点恢复：
 
-- **每完成一个 task**：按当前执行分支和 `review_mode` 完成验收后再勾选对应任务并提交。`subagent-driven-development` 在 `off` 时不派发每任务 reviewer；`standard` 下仅当任务命中风险信号时派发；`thorough` 下每个任务都派发每任务 reviewer。所有模式都必须按任务唯一文本完成定向检查。可用 `grep -c '\- \[ \]' tasks.md` 检查剩余未勾选数，无需重新读取整个文件
+- **每完成一个 task**：按当前执行分支和 `review_mode` 完成验收后再勾选对应任务并提交。`subagent-driven-development` 在 `off` 时不派发每任务 reviewer；`standard` 下仅当任务命中风险信号时派发；`thorough` 下每个任务都派发每任务 reviewer。所有模式都必须按任务唯一文本完成定向检查。通过解析 tasks.md 复选框统计剩余任务，无需反复读取与当前任务无关的正文
 - **上下文压缩后恢复**：按 `comet/reference/context-recovery.md` 执行，phase 参数为 `build`。
 - **用户手动修改恢复**：按 `comet/reference/dirty-worktree.md` 协议处理未提交改动。该协议定义了检查步骤、归因分类和禁令。build 阶段的特殊处理：
   1. 归因后，若 diff 暗示计划或 spec 已变化，按 Step 4「Spec 增量更新」分级处理
@@ -282,14 +293,22 @@ Build 是最长阶段，可能跨越大量任务。为支持上下文压缩后�
 - `tdd_mode` 已写为 `tdd` 或 `direct`
 - `review_mode` 已写为 `off`、`standard` 或 `thorough`
 - 已按所选 `review_mode` 完成"执行计划"章节中 executing-plans review gate 规定的代码审查：`standard` 或 `thorough` 下已请求代码审查且 CRITICAL review 发现已修复、非 CRITICAL review 发现已记录接受理由；`review_mode: off` 下已在持久产物中记录跳过自动代码审查的原因
-- **阶段守卫**：运行 `node "$COMET_GUARD" <change-name> build --apply`，全部 PASS 后由守卫推进到 `phase: verify`（此步骤更新 `phase` 字段，与 `auto_transition` 无关）
+- **阶段守卫**：运行 `comet guard <change-name> build --apply`，全部 PASS 后由守卫推进到 `phase: verify`（此步骤更新 `phase` 字段，与 `auto_transition` 无关）
 
 Guard 会运行自动探测到的项目构建检查（检测到时使用 `npm run build`、Maven 或 Cargo）。构建失败时 guard 会打印失败命令输出，作为排查证据。
+
+若项目没有可自动探测的构建命令，用户或 Agent 必须先自行运行真实构建命令，再单独记录构建证据：
+
+```bash
+comet state record-check <change-name> build --command "<实际运行的构建命令>" --exit-code 0
+```
+
+`--command` 只记录命令文本，Comet **绝不会执行该文本**。build 与 verify 证据彼此独立，不能互相替代。`COMET_SKIP_BUILD=1` 仅是旧流程的兼容绕过方式，不是可审计的构建证据。
 
 退出前运行阶段守卫推进 phase（此步骤与 `auto_transition` 无关）：
 
 ```bash
-node "$COMET_GUARD" <change-name> build --apply
+comet guard <change-name> build --apply
 ```
 
 状态文件自动更新为 `phase: verify`、`verify_result: pending`。
@@ -299,9 +318,9 @@ node "$COMET_GUARD" <change-name> build --apply
 按 `comet/reference/auto-transition.md` 执行。关键命令：
 
 ```bash
-node "$COMET_STATE" next <change-name>
+comet state next <change-name>
 ```
 
 - `NEXT: auto` → 调用 `SKILL` 指向的 skill 进入下一阶段
-- `NEXT: manual` → 不要调用下一 skill，按 `HINT` 提示用户手动运行 `/<SKILL>`
+- `NEXT: manual` → 不调用下一 skill，按 `HINT` 交还控制权并结束当前调用；不再创建确认点
 - `NEXT: done` → 流程已完成，无需继续

@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { ensureDir, fileExists } from '../fs/file-system.js';
+import { ensureDir } from '../fs/file-system.js';
 
 export const PROJECT_REGISTRY_SCHEMA_VERSION = 1;
 
@@ -64,8 +64,31 @@ function emptyRegistry(updatedAt: string): ProjectRegistry {
   };
 }
 
+function isMissingRegistryFile(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+async function registryFileExists(registryPath: string): Promise<boolean> {
+  try {
+    await fs.access(registryPath);
+    return true;
+  } catch (error) {
+    if (isMissingRegistryFile(error)) return false;
+    throw error;
+  }
+}
+
 function canonicalKey(canonicalPath: string): string {
   return process.platform === 'win32' ? canonicalPath.toLowerCase() : canonicalPath;
+}
+
+function findProjectRegistryEntryByCanonicalPath(
+  projects: ProjectRegistryEntry[],
+  canonicalPath: string,
+): ProjectRegistryEntry | undefined {
+  const key = canonicalKey(canonicalPath);
+  return projects.find((entry) => canonicalKey(entry.canonicalPath) === key);
 }
 
 function isProjectRegistrySource(value: unknown): value is ProjectRegistrySource {
@@ -180,6 +203,14 @@ async function resolveProjectPath(projectPath: string): Promise<{
   }
 }
 
+export async function findProjectRegistryEntry(
+  projectPath: string,
+  projects: ProjectRegistryEntry[],
+): Promise<ProjectRegistryEntry | undefined> {
+  const resolved = await resolveProjectPath(projectPath);
+  return findProjectRegistryEntryByCanonicalPath(projects, resolved.canonicalPath);
+}
+
 async function writeProjectRegistry(
   registry: ProjectRegistry,
   registryPath: string,
@@ -195,11 +226,19 @@ export async function readProjectRegistry(
 ): Promise<ProjectRegistry> {
   const registryPath = getProjectRegistryPath(options.homeDir);
   const updatedAt = nowIso(options);
-  if (!(await fileExists(registryPath))) return emptyRegistry(updatedAt);
+  if (!(await registryFileExists(registryPath))) return emptyRegistry(updatedAt);
+
+  let content: string;
+  try {
+    content = await fs.readFile(registryPath, 'utf-8');
+  } catch (error) {
+    if (isMissingRegistryFile(error)) return emptyRegistry(updatedAt);
+    throw error;
+  }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await fs.readFile(registryPath, 'utf-8'));
+    parsed = JSON.parse(content);
   } catch (error) {
     if (options.strict) {
       throw new ProjectRegistryError(
@@ -235,8 +274,11 @@ export async function upsertProjectInstallation(
   const timestamp = nowIso(options);
   const registry = await readProjectRegistry({ ...options, strict: false });
   const resolved = await resolveProjectPath(projectPath);
+  const existing = findProjectRegistryEntryByCanonicalPath(
+    registry.projects,
+    resolved.canonicalPath,
+  );
   const key = canonicalKey(resolved.canonicalPath);
-  const existing = registry.projects.find((entry) => canonicalKey(entry.canonicalPath) === key);
   const entry: ProjectRegistryEntry = {
     path: resolved.path,
     canonicalPath: resolved.canonicalPath,

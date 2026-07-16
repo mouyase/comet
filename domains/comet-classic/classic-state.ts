@@ -13,11 +13,12 @@ const BUILD_PAUSES = ['plan-ready'] as const;
 const SUBAGENT_DISPATCH = ['confirmed'] as const;
 const TDD_MODES = ['tdd', 'direct'] as const;
 const REVIEW_MODES = ['off', 'standard', 'thorough'] as const;
-const ISOLATIONS = ['branch', 'worktree'] as const;
+const ISOLATIONS = ['current', 'branch', 'worktree'] as const;
 const VERIFY_MODES = ['light', 'full'] as const;
 const VERIFY_RESULTS = ['pending', 'pass', 'fail'] as const;
 const BRANCH_STATUSES = ['pending', 'handled'] as const;
 const ARTIFACT_LAYOUTS = ['legacy', 'docs'] as const;
+const ARCHIVE_CONFIRMATIONS = ['pending', 'confirmed'] as const;
 
 export type ClassicProfile = (typeof CLASSIC_PROFILES)[number];
 export type ClassicPhase = (typeof PHASES)[number];
@@ -40,10 +41,12 @@ export interface ClassicState {
   designDoc: string | null;
   plan: string | null;
   verifyResult: (typeof VERIFY_RESULTS)[number];
+  verifyFailures: number;
   verificationReport: string | null;
   branchStatus: (typeof BRANCH_STATUSES)[number] | null;
   createdAt: string | null;
   verifiedAt: string | null;
+  archiveConfirmation: (typeof ARCHIVE_CONFIRMATIONS)[number] | null;
   archived: boolean;
   directOverride: boolean | null;
   handoffContext: string | null;
@@ -78,10 +81,12 @@ export const CLASSIC_WIRE_KEYS = [
   'design_doc',
   'plan',
   'verify_result',
+  'verify_failures',
   'verification_report',
   'branch_status',
   'created_at',
   'verified_at',
+  'archive_confirmation',
   'archived',
   'direct_override',
   'handoff_context',
@@ -158,6 +163,15 @@ function booleanValue(doc: StateDocument, key: string, nullable = true): boolean
   return value;
 }
 
+function nonNegativeInteger(doc: StateDocument, key: string, fallback = 0): number {
+  const value = doc[key];
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error(`Invalid Classic state: ${key} must be a non-negative integer`);
+  }
+  return value;
+}
+
 function relativePath(doc: StateDocument, key: string): string | null {
   const value = nullableString(doc, key);
   if (value === null) return null;
@@ -211,10 +225,12 @@ function classicStateFromDocument(doc: StateDocument): ClassicState | null {
     designDoc: relativePath(doc, 'design_doc'),
     plan: relativePath(doc, 'plan'),
     verifyResult: enumValue(doc, 'verify_result', VERIFY_RESULTS, false)!,
+    verifyFailures: nonNegativeInteger(doc, 'verify_failures'),
     verificationReport: relativePath(doc, 'verification_report'),
     branchStatus: enumValue(doc, 'branch_status', BRANCH_STATUSES),
     createdAt: nullableString(doc, 'created_at'),
     verifiedAt: nullableString(doc, 'verified_at'),
+    archiveConfirmation: enumValue(doc, 'archive_confirmation', ARCHIVE_CONFIRMATIONS),
     archived: booleanValue(doc, 'archived', false)!,
     directOverride: booleanValue(doc, 'direct_override'),
     handoffContext: relativePath(doc, 'handoff_context'),
@@ -301,10 +317,12 @@ export function classicStateToDocument(state: ClassicState): StateDocument {
     design_doc: state.designDoc,
     plan: state.plan,
     verify_result: state.verifyResult,
+    verify_failures: state.verifyFailures,
     verification_report: state.verificationReport,
     branch_status: state.branchStatus,
     created_at: state.createdAt,
     verified_at: state.verifiedAt,
+    archive_confirmation: state.archiveConfirmation,
     archived: state.archived,
     direct_override: state.directOverride,
     handoff_context: state.handoffContext,

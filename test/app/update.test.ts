@@ -76,6 +76,43 @@ const claudePlatform: Platform = {
   openspecToolId: 'claude',
 };
 
+type ComponentFailure = 'Skill' | 'Rule' | 'Hook';
+
+async function arrangeComponentFailure(
+  projectPath: string,
+  failure: ComponentFailure,
+): Promise<{ installMode: 'copy' | 'symlink' }> {
+  await fs.mkdir(path.join(projectPath, '.codex'), { recursive: true });
+
+  if (failure === 'Skill') {
+    await fs.mkdir(path.join(projectPath, '.codex', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, '.codex', 'skills', 'comet', 'SKILL.md'),
+      '# Legacy Comet\n',
+    );
+    await fs.mkdir(path.join(projectPath, '.agents', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, '.agents', 'skills', 'comet', 'user-file.md'),
+      '# Keep\n',
+    );
+    return { installMode: 'symlink' };
+  }
+
+  await fs.mkdir(path.join(projectPath, '.agents', 'skills', 'comet'), { recursive: true });
+  await fs.writeFile(
+    path.join(projectPath, '.agents', 'skills', 'comet', 'SKILL.md'),
+    '# Comet\n\nUse this skill.\n',
+  );
+
+  if (failure === 'Rule') {
+    await fs.writeFile(path.join(projectPath, '.codex', 'rules'), 'blocking file');
+  } else {
+    await fs.mkdir(path.join(projectPath, '.codex', 'hooks.json'), { recursive: true });
+  }
+
+  return { installMode: 'copy' };
+}
+
 describe('update command helpers', () => {
   let tmpDir: string;
 
@@ -144,9 +181,10 @@ describe('update command helpers', () => {
 
     await fs.mkdir(path.join(projectDir, '.cursor'), { recursive: true });
 
-    await fs.mkdir(path.join(globalDir, '.codex', 'skills', 'comet'), { recursive: true });
+    await fs.mkdir(path.join(globalDir, '.agents', 'skills', 'comet'), { recursive: true });
+    await fs.mkdir(path.join(globalDir, '.codex'), { recursive: true });
     await fs.writeFile(
-      path.join(globalDir, '.codex', 'skills', 'comet', 'SKILL.md'),
+      path.join(globalDir, '.agents', 'skills', 'comet', 'SKILL.md'),
       '# Comet\n\n当用户提出需求时使用这个技能。',
       'utf-8',
     );
@@ -176,8 +214,9 @@ describe('update command helpers', () => {
 
     await fs.mkdir(path.join(projectDir, '.claude', 'skills', 'comet'), { recursive: true });
     await fs.writeFile(path.join(projectDir, '.claude', 'skills', 'comet', 'SKILL.md'), '# Comet');
-    await fs.mkdir(path.join(globalDir, '.codex', 'skills', 'comet'), { recursive: true });
-    await fs.writeFile(path.join(globalDir, '.codex', 'skills', 'comet', 'SKILL.md'), '# Comet');
+    await fs.mkdir(path.join(globalDir, '.agents', 'skills', 'comet'), { recursive: true });
+    await fs.mkdir(path.join(globalDir, '.codex'), { recursive: true });
+    await fs.writeFile(path.join(globalDir, '.agents', 'skills', 'comet', 'SKILL.md'), '# Comet');
 
     const targets = await detectInstalledCometTargets(projectDir, {
       globalBaseDir: globalDir,
@@ -185,6 +224,54 @@ describe('update command helpers', () => {
     });
 
     expect(targets.map((t) => `${t.scope}:${t.platform.id}`)).toEqual(['global:codex']);
+  });
+
+  it('does not infer Codex from a shared canonical Skill directory without Codex detection paths', async () => {
+    const projectDir = path.join(tmpDir, 'shared-agents-only');
+    await fs.mkdir(path.join(projectDir, '.agents', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, '.agents', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n',
+    );
+
+    const targets = await detectInstalledCometTargets(projectDir, { scopes: ['project'] });
+
+    expect(targets.map((target) => target.platform.id)).toEqual(['antigravity']);
+  });
+
+  it('assigns a shared project .agents Skill root only to Codex when .codex evidence exists', async () => {
+    const projectDir = path.join(tmpDir, 'shared-agents-with-codex');
+    await fs.mkdir(path.join(projectDir, '.agents', 'skills', 'comet'), { recursive: true });
+    await fs.mkdir(path.join(projectDir, '.codex'), { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, '.agents', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n',
+    );
+
+    const targets = await detectInstalledCometTargets(projectDir, { scopes: ['project'] });
+
+    expect(targets.map((target) => target.platform.id)).toEqual(['codex']);
+  });
+
+  it('updates an explicitly scoped canonical global Codex install without a detection path', async () => {
+    const projectDir = path.join(tmpDir, 'explicit-global-project');
+    const fakeHome = path.join(tmpDir, 'explicit-global-home');
+    await fs.mkdir(path.join(fakeHome, '.agents', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(path.join(fakeHome, '.agents', 'skills', 'comet', 'SKILL.md'), '# Comet\n');
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    let json: string;
+    try {
+      await updateCommand(projectDir, { json: true, skipNpm: true, scope: 'global' });
+      json = log.mock.calls.map((call) => call.join(' ')).join('\n');
+    } finally {
+      log.mockRestore();
+      homedirSpy.mockRestore();
+    }
+
+    expect(JSON.parse(json).skills.targets).toEqual([
+      expect.objectContaining({ scope: 'global', platform: 'codex' }),
+    ]);
   });
 
   it('detects legacy global Pi skills so update can migrate them', async () => {
@@ -207,6 +294,342 @@ describe('update command helpers', () => {
       'global:pi:en',
     ]);
     expect(PLATFORMS.find((platform) => platform.id === 'pi')?.globalSkillsDir).toBe('.pi/agent');
+  });
+
+  it('migrates legacy Codex skills after canonical installation and preserves unrelated skills', async () => {
+    const fakeHome = path.join(tmpDir, 'home');
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const legacyComet = path.join(tmpDir, '.codex', 'skills', 'comet');
+    const legacyPersonal = path.join(tmpDir, '.codex', 'skills', 'personal');
+    await fs.mkdir(legacyComet, { recursive: true });
+    await fs.mkdir(legacyPersonal, { recursive: true });
+    await fs.writeFile(path.join(legacyComet, 'SKILL.md'), '# Comet\n\nUse this skill.');
+    await fs.writeFile(path.join(legacyPersonal, 'SKILL.md'), '# Personal\n');
+    const legacyHookPath = path.join(tmpDir, '.codex', 'settings.local.json');
+    await fs.mkdir(path.dirname(legacyHookPath), { recursive: true });
+    await fs.writeFile(
+      legacyHookPath,
+      JSON.stringify(
+        {
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: 'Write|Edit',
+                hooks: [
+                  {
+                    type: 'command',
+                    command: 'node .codex/skills/comet/scripts/comet-hook-guard.mjs',
+                  },
+                  { type: 'command', command: 'node my-user-hook.mjs' },
+                ],
+              },
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await updateCommand(tmpDir, { skipNpm: true, scope: 'project' });
+    } finally {
+      log.mockRestore();
+      homedirSpy.mockRestore();
+    }
+
+    await expect(
+      fs.access(path.join(tmpDir, '.agents', 'skills', 'comet', 'SKILL.md')),
+    ).resolves.toBeUndefined();
+    await expect(fs.access(legacyComet)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.readFile(path.join(legacyPersonal, 'SKILL.md'), 'utf8')).resolves.toBe(
+      '# Personal\n',
+    );
+    const hooks = JSON.parse(await fs.readFile(path.join(tmpDir, '.codex', 'hooks.json'), 'utf8'));
+    expect(hooks.hooks.PreToolUse[0].hooks[0].command.replaceAll('\\', '/')).toContain(
+      '/.agents/skills/comet/scripts/comet-hook-guard.mjs',
+    );
+    const legacy = JSON.parse(
+      await fs.readFile(path.join(tmpDir, '.codex', 'settings.local.json'), 'utf8'),
+    );
+    expect(legacy.hooks.PreToolUse[0].hooks).toEqual([
+      { type: 'command', command: 'node my-user-hook.mjs' },
+    ]);
+    await expect(
+      fs.access(path.join(tmpDir, '.agents', 'settings.local.json')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not update Codex hooks when the managed Hook script cannot be copied', async () => {
+    const fakeHome = path.join(tmpDir, 'hook-copy-failure-home');
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const skillDir = path.join(tmpDir, '.agents', 'skills', 'comet');
+    await fs.mkdir(path.join(tmpDir, '.codex'), { recursive: true });
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(path.join(skillDir, 'SKILL.md'), '# Comet\n\nUse this skill.');
+    await fs.writeFile(path.join(skillDir, 'scripts'), 'blocking file');
+
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await updateCommand(tmpDir, { skipNpm: true, scope: 'project' });
+    } finally {
+      log.mockRestore();
+      homedirSpy.mockRestore();
+    }
+
+    await expect(fs.access(path.join(tmpDir, '.codex', 'hooks.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it.each<ComponentFailure>(['Skill', 'Rule', 'Hook'])(
+    '%s failure is reported as incomplete in JSON and does not refresh the registry',
+    async (failure) => {
+      const fakeHome = path.join(tmpDir, `component-failure-json-${failure}`);
+      const options = await arrangeComponentFailure(tmpDir, failure);
+      await upsertProjectInstallation(tmpDir, [{ platform: 'codex', language: 'en' }], 'init', {
+        homeDir: fakeHome,
+      });
+      const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        await updateCommand(tmpDir, {
+          json: true,
+          skipNpm: true,
+          scope: 'project',
+          installMode: options.installMode,
+        });
+        const result = JSON.parse(log.mock.calls.map((call) => call.join(' ')).join('\n'));
+        expect(result.status).toBe('incomplete');
+        expect(result.skills.totalFailed > 0).toBe(failure === 'Skill');
+        expect(result.rules.totalFailed > 0).toBe(failure === 'Rule');
+        expect(result.hooks.totalFailed > 0).toBe(failure === 'Hook');
+
+        const component = `${failure.toLowerCase()}s` as 'skills' | 'rules' | 'hooks';
+        expect(result[component].targets[0].failed).toBeGreaterThan(0);
+        expect(result[component].targets[0].reason).toEqual(expect.any(String));
+      } finally {
+        log.mockRestore();
+        homedirSpy.mockRestore();
+      }
+
+      const registry = JSON.parse(await fs.readFile(getProjectRegistryPath(fakeHome), 'utf-8')) as {
+        projects: Array<{ lastSource: string }>;
+      };
+      expect(registry.projects[0].lastSource).toBe('init');
+
+      if (failure === 'Skill') {
+        await expect(
+          fs.access(path.join(tmpDir, '.codex', 'rules', 'comet-phase-guard.md')),
+        ).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(fs.access(path.join(tmpDir, '.codex', 'hooks.json'))).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+      }
+    },
+  );
+
+  it.each<ComponentFailure>(['Skill', 'Rule', 'Hook'])(
+    '%s failure is reported as incomplete in text output',
+    async (failure) => {
+      const fakeHome = path.join(tmpDir, `component-failure-text-${failure}`);
+      const options = await arrangeComponentFailure(tmpDir, failure);
+      const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        await updateCommand(tmpDir, {
+          skipNpm: true,
+          scope: 'project',
+          installMode: options.installMode,
+        });
+        const output = log.mock.calls.map((call) => call.join(' ')).join('\n');
+        expect(output).toMatch(/incomplete/iu);
+        if (failure === 'Skill') {
+          expect(output).toContain(
+            'Codex (project) Skill: failed (1) - 1 Skill file(s) failed to install',
+          );
+          expect(output).not.toMatch(/Antigravity.*Skill: failed/u);
+        } else if (failure === 'Rule') {
+          expect(output).toContain(
+            'Codex (project) Rule: failed (1) - 1 Rule file(s) failed to install',
+          );
+        } else {
+          expect(output).toMatch(
+            /Codex \(project\) Hook: failed \(1\) - Invalid Codex settings at .*hooks\.json: EISDIR/iu,
+          );
+        }
+      } finally {
+        log.mockRestore();
+        homedirSpy.mockRestore();
+      }
+    },
+  );
+
+  it.each<ComponentFailure>(['Skill', 'Rule', 'Hook'])(
+    '%s failure marks all-projects status failed',
+    async (failure) => {
+      const fakeHome = path.join(tmpDir, `component-failure-all-projects-${failure}`);
+      const project = path.join(tmpDir, `component-failure-project-${failure}`);
+      const options = await arrangeComponentFailure(project, failure);
+      await upsertProjectInstallation(project, [{ platform: 'codex', language: 'en' }], 'init', {
+        homeDir: fakeHome,
+      });
+      const registryBefore = await fs.readFile(getProjectRegistryPath(fakeHome), 'utf-8');
+      const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        await updateCommand(project, {
+          allProjects: true,
+          json: true,
+          skipNpm: true,
+          installMode: options.installMode,
+        });
+        const result = JSON.parse(log.mock.calls.map((call) => call.join(' ')).join('\n'));
+        expect(result.projects[0].status).toBe('failed');
+        expect(result.projects[0].reason).toMatch(new RegExp(failure, 'iu'));
+        const failures = result.projects[0].failures as Array<Record<string, unknown>>;
+        if (failure === 'Skill') {
+          expect(failures).toEqual([
+            expect.objectContaining({
+              platformName: 'Codex',
+              scope: 'project',
+              component: 'Skill',
+              status: 'failed',
+              failed: 1,
+              reason: '1 Skill file(s) failed to install',
+            }),
+          ]);
+        } else if (failure === 'Rule') {
+          expect(failures).toContainEqual(
+            expect.objectContaining({
+              platform: 'codex',
+              platformName: 'Codex',
+              scope: 'project',
+              component: 'Rule',
+              status: 'failed',
+              failed: 1,
+              reason: '1 Rule file(s) failed to install',
+            }),
+          );
+        } else {
+          expect(failures).toContainEqual(
+            expect.objectContaining({
+              platform: 'codex',
+              platformName: 'Codex',
+              scope: 'project',
+              component: 'Hook',
+              status: 'failed',
+              failed: 1,
+              reason: expect.stringMatching(/Invalid Codex settings at .*hooks\.json: EISDIR/iu),
+            }),
+          );
+        }
+      } finally {
+        log.mockRestore();
+        homedirSpy.mockRestore();
+      }
+
+      await expect(fs.readFile(getProjectRegistryPath(fakeHome), 'utf-8')).resolves.toBe(
+        registryBefore,
+      );
+    },
+  );
+
+  it.each([true, false])(
+    'reports legacy Codex cleanup refusal as incomplete in %s output',
+    async (json) => {
+      const fakeHome = path.join(tmpDir, `cleanup-failure-home-${json}`);
+      const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+      const legacyTarget = path.join(tmpDir, 'legacy-shared-skills');
+      const legacySkills = path.join(tmpDir, '.codex', 'skills');
+      await fs.mkdir(path.join(legacyTarget, 'comet'), { recursive: true });
+      await fs.writeFile(path.join(legacyTarget, 'comet', 'SKILL.md'), '# Legacy Comet\n');
+      await fs.mkdir(path.dirname(legacySkills), { recursive: true });
+      await fs.symlink(
+        legacyTarget,
+        legacySkills,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      try {
+        await updateCommand(tmpDir, { skipNpm: true, scope: 'project', json });
+        const output = log.mock.calls.map((call) => call.join(' ')).join('\n');
+        if (json) {
+          const result = JSON.parse(output);
+          expect(result.skills.cleanupFailed).toBeGreaterThan(0);
+          expect(result.skills.targets[0].cleanupFailed).toBeGreaterThan(0);
+          expect(result.skills.targets[0].reason).toMatch(/cleanup/iu);
+        } else {
+          expect(output).toMatch(/incomplete|failed/iu);
+        }
+      } finally {
+        log.mockRestore();
+        homedirSpy.mockRestore();
+      }
+
+      await expect(
+        fs.access(path.join(tmpDir, '.agents', 'skills', 'comet', 'SKILL.md')),
+      ).resolves.toBeUndefined();
+      await expect(fs.lstat(legacySkills)).resolves.toMatchObject({});
+    },
+  );
+
+  it('marks all-projects update failed when legacy Codex cleanup is refused', async () => {
+    const fakeHome = path.join(tmpDir, 'all-projects-home-cleanup-failure');
+    const project = path.join(tmpDir, 'all-projects-cleanup-failure');
+    const legacyTarget = path.join(tmpDir, 'all-projects-legacy-target');
+    await fs.mkdir(path.join(project, '.codex'), { recursive: true });
+    await fs.mkdir(path.join(legacyTarget, 'comet'), { recursive: true });
+    await fs.writeFile(path.join(legacyTarget, 'comet', 'SKILL.md'), '# Legacy Comet\n');
+    await fs.symlink(
+      legacyTarget,
+      path.join(project, '.codex', 'skills'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    await upsertProjectInstallation(project, [{ platform: 'codex', language: 'en' }], 'init', {
+      homeDir: fakeHome,
+    });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await updateCommand(project, { allProjects: true, json: true, skipNpm: true });
+      const result = JSON.parse(log.mock.calls.map((call) => call.join(' ')).join('\n'));
+      expect(result.projects[0].status).toBe('failed');
+      expect(result.projects[0].reason).toMatch(/cleanup/iu);
+    } finally {
+      log.mockRestore();
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('preserves legacy Codex skills when the canonical installation is incomplete', async () => {
+    const fakeHome = path.join(tmpDir, 'home-incomplete');
+    const legacySkill = path.join(tmpDir, '.codex', 'skills', 'comet', 'SKILL.md');
+    const canonicalConflict = path.join(tmpDir, '.agents', 'skills', 'comet', 'user-file.md');
+    await fs.mkdir(path.dirname(legacySkill), { recursive: true });
+    await fs.writeFile(legacySkill, '# Legacy Comet\n');
+    await fs.mkdir(path.dirname(canonicalConflict), { recursive: true });
+    await fs.writeFile(canonicalConflict, '# Keep\n');
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await updateCommand(tmpDir, {
+        skipNpm: true,
+        scope: 'project',
+        installMode: 'symlink',
+      });
+    } finally {
+      error.mockRestore();
+      log.mockRestore();
+      homedirSpy.mockRestore();
+    }
+
+    await expect(fs.readFile(legacySkill, 'utf8')).resolves.toBe('# Legacy Comet\n');
   });
 
   it('detects project package scope from local node_modules install path', async () => {
@@ -283,7 +706,7 @@ describe('update command helpers', () => {
     const fakeHome = path.join(tmpDir, 'fake-home-print-command');
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    let output = '';
+    let output: string;
     try {
       await updateCommand(tmpDir, { skipNpm: true });
       output = log.mock.calls.map((call) => call.join(' ')).join('\n');
@@ -399,7 +822,7 @@ describe('update command helpers', () => {
     const fakeHome = path.join(tmpDir, 'fake-home-json');
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    let json = '';
+    let json: string;
     try {
       await updateCommand(tmpDir, { json: true, skipNpm: true });
       json = log.mock.calls.map((call) => call.join(' ')).join('\n');
@@ -540,6 +963,47 @@ describe('update command helpers', () => {
         expect.anything(),
       ]),
     );
+  });
+
+  it('reports global npm update failure before updating all indexed projects', async () => {
+    const fakeHome = path.join(tmpDir, 'fake-home-global-npm-failure');
+    const projectA = path.join(tmpDir, 'project-a-global-failure');
+    const projectB = path.join(tmpDir, 'project-b-global-failure');
+
+    for (const project of [projectA, projectB]) {
+      await fs.mkdir(path.join(project, '.claude', 'skills', 'comet'), { recursive: true });
+      await fs.writeFile(path.join(project, '.claude', 'skills', 'comet', 'SKILL.md'), '# Comet');
+      await upsertProjectInstallation(project, [{ platform: 'claude', language: 'en' }], 'init', {
+        homeDir: fakeHome,
+      });
+    }
+
+    mockedSpawn.mockImplementationOnce(() => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('exit', 1));
+      return child as ReturnType<typeof spawn>;
+    });
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    let json: string;
+    try {
+      await updateCommand(projectA, { json: true, allProjects: true });
+      json = log.mock.calls.map((call) => call.join(' ')).join('\n');
+    } finally {
+      log.mockRestore();
+      homedirSpy.mockRestore();
+    }
+
+    const result = JSON.parse(json);
+    expect(result.projects).toEqual([
+      expect.objectContaining({
+        projectPath: path.resolve(projectA),
+        status: 'failed',
+        reason: expect.stringContaining('npm package update failed'),
+      }),
+    ]);
+    expect(mockedSpawn).toHaveBeenCalledTimes(1);
   });
 
   it('removes stale indexed projects that no longer have project-scope installs during all-projects update', async () => {
@@ -744,8 +1208,9 @@ describe('update command helpers', () => {
   it('does not create or update root project instructions when only global targets are updated', async () => {
     const fakeHome = path.join(tmpDir, 'fake-home');
     await fs.mkdir(path.join(fakeHome, '.codex', 'skills', 'comet'), { recursive: true });
+    await fs.mkdir(path.join(fakeHome, '.agents', 'skills', 'comet'), { recursive: true });
     await fs.writeFile(
-      path.join(fakeHome, '.codex', 'skills', 'comet', 'SKILL.md'),
+      path.join(fakeHome, '.agents', 'skills', 'comet', 'SKILL.md'),
       '# Comet\n\nUse this skill.',
       'utf-8',
     );
@@ -833,5 +1298,98 @@ describe('update command helpers', () => {
         message: expect.stringContaining('CodeGraph'),
       }),
     );
+  });
+
+  it('persists the installed language when updating global Comet skills', async () => {
+    const fakeHome = path.join(tmpDir, 'fake-home');
+    await fs.mkdir(path.join(fakeHome, '.codex', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(fakeHome, '.codex', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n\n当用户提出需求时使用这个技能。',
+      'utf-8',
+    );
+    const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await updateCommand(tmpDir, {
+        json: true,
+        skipNpm: true,
+        scope: 'global',
+        language: 'zh',
+      });
+    } finally {
+      log.mockRestore();
+      homeSpy.mockRestore();
+    }
+
+    const config = await fs.readFile(path.join(fakeHome, '.comet', 'config.yaml'), 'utf-8');
+    expect(config).toContain('language: zh-CN');
+    await expect(fs.stat(path.join(fakeHome, 'docs', 'superpowers'))).rejects.toThrow();
+  });
+
+  it('re-persists an explicitly requested language even when the config already has a different one', async () => {
+    const fakeHome = path.join(tmpDir, 'fake-home');
+    await fs.mkdir(path.join(fakeHome, '.codex', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(fakeHome, '.codex', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n\nUse this skill.',
+      'utf-8',
+    );
+    await fs.mkdir(path.join(fakeHome, '.comet'), { recursive: true });
+    await fs.writeFile(path.join(fakeHome, '.comet', 'config.yaml'), 'language: en\n', 'utf-8');
+
+    const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await updateCommand(tmpDir, {
+        json: true,
+        skipNpm: true,
+        scope: 'global',
+        language: 'zh',
+      });
+    } finally {
+      log.mockRestore();
+      homeSpy.mockRestore();
+    }
+
+    const config = await fs.readFile(path.join(fakeHome, '.comet', 'config.yaml'), 'utf-8');
+    expect(config).toContain('language: zh-CN');
+  });
+
+  it('does not guess a language when installed platforms in the same scope disagree and none is requested', async () => {
+    const fakeHome = path.join(tmpDir, 'fake-home');
+    await fs.mkdir(path.join(fakeHome, '.claude', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(fakeHome, '.claude', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n\nUse this skill.',
+      'utf-8',
+    );
+    await fs.mkdir(path.join(fakeHome, '.cursor', 'skills', 'comet'), { recursive: true });
+    await fs.writeFile(
+      path.join(fakeHome, '.cursor', 'skills', 'comet', 'SKILL.md'),
+      '# Comet\n\n当用户提出需求时使用这个技能。',
+      'utf-8',
+    );
+    await fs.mkdir(path.join(fakeHome, '.comet'), { recursive: true });
+    await fs.writeFile(path.join(fakeHome, '.comet', 'config.yaml'), 'language: en\n', 'utf-8');
+
+    const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(fakeHome);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await updateCommand(tmpDir, {
+        json: true,
+        skipNpm: true,
+        scope: 'global',
+      });
+    } finally {
+      log.mockRestore();
+      homeSpy.mockRestore();
+    }
+
+    const config = await fs.readFile(path.join(fakeHome, '.comet', 'config.yaml'), 'utf-8');
+    expect(config).toContain('language: en');
   });
 });

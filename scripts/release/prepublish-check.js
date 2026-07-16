@@ -41,7 +41,9 @@ function normalized(value) {
   return value.replaceAll('\\', '/').replace(/^\.\//u, '').replace(/\/+/gu, '/');
 }
 
-function* walkIncludedPath(relativePath) {
+function* walkIncludedPath(relativePath, excludes) {
+  if (isExcludedFromPackage(relativePath, excludes)) return;
+
   const stat = statSync(relativePath);
   if (stat.isFile()) {
     yield normalized(relativePath);
@@ -50,7 +52,7 @@ function* walkIncludedPath(relativePath) {
   if (!stat.isDirectory()) return;
 
   for (const entry of readdirSync(relativePath)) {
-    yield* walkIncludedPath(join(relativePath, entry));
+    yield* walkIncludedPath(join(relativePath, entry), excludes);
   }
 }
 
@@ -64,20 +66,35 @@ function readPackageFileList() {
   return { includes, excludes };
 }
 
+function packagePatternRegExp(pattern) {
+  let source = '';
+  for (let index = 0; index < pattern.length; index++) {
+    const character = pattern[index];
+    if (character === '*') {
+      if (pattern[index + 1] === '*') {
+        if (pattern[index + 2] === '/') {
+          source += '(?:.*/)?';
+          index += 2;
+        } else {
+          source += '.*';
+          index += 1;
+        }
+      } else {
+        source += '[^/]*';
+      }
+    } else if (character === '?') {
+      source += '[^/]';
+    } else {
+      source += character.replace(/[\\^$+.()|[\]{}]/gu, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}(?:/.*)?$`, 'u');
+}
+
 function isExcludedFromPackage(filePath, excludes) {
   const path = normalized(filePath);
   for (const pattern of excludes) {
-    if (pattern === 'dist/**/*.test.js' && path.startsWith('dist/') && path.endsWith('.test.js')) {
-      return true;
-    }
-    if (
-      pattern === 'dist/**/__tests__' &&
-      path.startsWith('dist/') &&
-      path.split('/').includes('__tests__')
-    ) {
-      return true;
-    }
-    if (path === pattern || path.startsWith(`${pattern}/`)) {
+    if (packagePatternRegExp(pattern).test(path)) {
       return true;
     }
   }
@@ -104,7 +121,7 @@ function publishedFiles() {
   for (const entry of [...alwaysIncludedPackageFiles(), ...includes]) {
     const relativePath = normalized(entry);
     if (!relativePath || relativePath.startsWith('!') || !existsSync(relativePath)) continue;
-    for (const filePath of walkIncludedPath(relativePath)) {
+    for (const filePath of walkIncludedPath(relativePath, excludes)) {
       if (!isExcludedFromPackage(filePath, excludes)) {
         paths.add(filePath);
       }

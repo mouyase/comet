@@ -4,11 +4,16 @@ import { existsSync, promises as fs } from 'fs';
 import path from 'path';
 import { Document, parseDocument } from 'yaml';
 import type { ClassicCommandHandler, ClassicCommandResult } from './classic-cli.js';
+import {
+  clearCurrentChange,
+  resolveCurrentChange,
+  selectCurrentChange,
+} from './classic-current-change.js';
 import { collectClassicEvidence } from './classic-evidence.js';
 import { projectRelativePath, resolveCometArtifactLayout } from './classic-artifact-layout.js';
 import { openSpecChangeNameError, resolveClassicChangeDirectory } from './classic-paths.js';
 import { resolveClassicStepId } from './classic-resolver.js';
-import { transitionClassicRuntimeRun } from './classic-runtime-run.js';
+import { transitionClassicRuntimeRun, validateClassicRuntimeRun } from './classic-runtime-run.js';
 import { appendClassicStateEvent } from './classic-state-events.js';
 import {
   CLASSIC_WIRE_KEYS,
@@ -24,6 +29,8 @@ import {
 } from './classic-transitions.js';
 import { readRunState } from '../../domains/engine/state.js';
 import { appendTrajectory, readTrajectory } from '../../domains/engine/run-store.js';
+import { recordCommandCheck, type CommandCheckScope } from './classic-command-checks.js';
+import { readClassicConfigValue } from './classic-project-config.js';
 
 const GREEN = '\u001b[32m';
 const RED = '\u001b[31m';
@@ -35,6 +42,8 @@ const ARTIFACT_LANGUAGES = ['en', 'zh-CN'] as const;
 const EVENTS = CLASSIC_TRANSITION_EVENTS;
 const MACHINE_OWNED_FIELDS = new Set<string>([
   ...RUN_WIRE_KEYS,
+  'archive_confirmation',
+  'verify_failures',
   'classic_profile',
   'classic_migration',
 ]);
@@ -51,11 +60,12 @@ const FIELD_ENUMS: Record<string, readonly string[]> = {
   subagent_dispatch: ['null', 'confirmed'],
   tdd_mode: ['tdd', 'direct'],
   review_mode: ['off', 'standard', 'thorough'],
-  isolation: ['branch', 'worktree'],
+  isolation: ['current', 'branch', 'worktree'],
   verify_mode: ['light', 'full'],
   auto_transition: ['true', 'false'],
   verify_result: ['pending', 'pass', 'fail'],
   branch_status: ['pending', 'handled'],
+  archive_confirmation: ['pending', 'confirmed'],
   archived: ['true', 'false'],
   direct_override: ['true', 'false'],
   artifact_layout: ['legacy', 'docs'],
@@ -83,7 +93,9 @@ const CLASSIC_FIELD_WIRE_NAMES: Partial<Record<keyof ClassicState, string>> = {
   superpowersRoot: 'superpowers_root',
   verificationReport: 'verification_report',
   verifiedAt: 'verified_at',
+  archiveConfirmation: 'archive_confirmation',
   verifyResult: 'verify_result',
+  verifyFailures: 'verify_failures',
   workflow: 'workflow',
 };
 
@@ -247,6 +259,15 @@ function nullableRecordBoolean(record: Record<string, unknown>, field: string): 
   return null;
 }
 
+function nonNegativeRecordInteger(
+  record: Record<string, unknown>,
+  field: string,
+  fallback = 0,
+): number {
+  const value = record[field];
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
 function sparseClassicState(record: Record<string, unknown>): ClassicState {
   const workflow = enumRecordValue(record, 'workflow', PROFILES, 'full')!;
   return {
@@ -274,7 +295,12 @@ function sparseClassicState(record: Record<string, unknown>): ClassicState {
       ['off', 'standard', 'thorough'] as const,
       null,
     ),
-    isolation: enumRecordValue(record, 'isolation', ['branch', 'worktree'] as const, null),
+    isolation: enumRecordValue(
+      record,
+      'isolation',
+      ['current', 'branch', 'worktree'] as const,
+      null,
+    ),
     verifyMode: enumRecordValue(record, 'verify_mode', ['light', 'full'] as const, null),
     autoTransition: nullableRecordBoolean(record, 'auto_transition'),
     baseRef: nullableRecordString(record, 'base_ref'),
@@ -286,10 +312,17 @@ function sparseClassicState(record: Record<string, unknown>): ClassicState {
       ['pending', 'pass', 'fail'] as const,
       'pending',
     )!,
+    verifyFailures: nonNegativeRecordInteger(record, 'verify_failures'),
     verificationReport: nullableRecordString(record, 'verification_report'),
     branchStatus: enumRecordValue(record, 'branch_status', ['pending', 'handled'] as const, null),
     createdAt: nullableRecordString(record, 'created_at'),
     verifiedAt: nullableRecordString(record, 'verified_at'),
+    archiveConfirmation: enumRecordValue(
+      record,
+      'archive_confirmation',
+      ['pending', 'confirmed'] as const,
+      null,
+    ),
     archived: nullableRecordBoolean(record, 'archived') ?? false,
     directOverride: nullableRecordBoolean(record, 'direct_override'),
     handoffContext: nullableRecordString(record, 'handoff_context'),
@@ -306,18 +339,14 @@ function sparseClassicState(record: Record<string, unknown>): ClassicState {
 async function projectConfigValue(
   field: 'context_compression' | 'auto_transition' | 'review_mode' | 'language',
 ): Promise<string | null> {
-  const file = path.resolve('.comet', 'config.yaml');
-  if (!(await exists(file))) return null;
-  const document = await readDocument(file);
-  const value = document.get(field);
-  return value === null || value === undefined ? null : scalar(value);
+  return (await readClassicConfigValue(field))?.value ?? null;
 }
 
 async function projectLanguageDefault(): Promise<string> {
   if (process.env.COMET_LANGUAGE)
     return validateLanguage(process.env.COMET_LANGUAGE, 'COMET_LANGUAGE');
-  const value = await projectConfigValue('language');
-  if (value) return validateLanguage(value, '.comet/config.yaml');
+  const configured = await readClassicConfigValue('language');
+  if (configured) return validateLanguage(configured.value, configured.source);
   return 'en';
 }
 
@@ -414,7 +443,7 @@ async function setField(
   options: { internal?: boolean; machineOwned?: boolean } = {},
 ): Promise<void> {
   if (MACHINE_OWNED_FIELDS.has(field) && !options.machineOwned) {
-    fail(`ERROR: '${field}' is a machine-owned Run field and cannot be set directly`);
+    fail(`ERROR: '${field}' is a machine-owned field and cannot be set directly`);
   }
   if (!SETTABLE_FIELDS.has(field) && !MACHINE_OWNED_FIELDS.has(field)) {
     fail(`ERROR: Unknown field: '${field}'`);
@@ -500,17 +529,19 @@ async function init(output: CommandOutput, name: string, workflow: string): Prom
     subagent_dispatch: null,
     tdd_mode: preset ? 'direct' : null,
     review_mode: reviewMode,
-    isolation: preset ? 'branch' : null,
+    isolation: preset ? 'current' : null,
     verify_mode: preset ? 'light' : null,
     auto_transition: (await autoTransition()) === 'true',
     base_ref: gitOutput(['rev-parse', '--verify', 'HEAD']),
     design_doc: null,
     plan: null,
     verify_result: 'pending',
+    verify_failures: 0,
     verification_report: null,
     branch_status: 'pending',
     created_at: new Date().toISOString().slice(0, 10),
     verified_at: null,
+    archive_confirmation: null,
     archived: false,
     artifact_layout: layout.layout,
     openspec_root: openSpecRoot,
@@ -535,9 +566,11 @@ async function requireBuildDecisions(name: string): Promise<void> {
   const subagentDispatch = await readField(name, 'subagent_dispatch');
   const tddMode = await readField(name, 'tdd_mode');
   const reviewMode = await readField(name, 'review_mode');
-  if (!['branch', 'worktree'].includes(isolation)) {
+  const allowedIsolation =
+    workflow === 'full' ? ['branch', 'worktree'] : ['current', 'branch', 'worktree'];
+  if (!allowedIsolation.includes(isolation)) {
     fail(
-      `ERROR: Cannot transition '${name}': isolation must be branch or worktree, got '${isolation || 'null'}'`,
+      `ERROR: Cannot transition '${name}': isolation must be ${workflow === 'full' ? 'branch or worktree' : 'current, branch, or worktree'}, got '${isolation || 'null'}'`,
     );
   }
   if (!['subagent-driven-development', 'executing-plans', 'direct'].includes(buildMode)) {
@@ -676,11 +709,16 @@ async function transition(output: CommandOutput, name: string, event: string): P
         `ERROR: Cannot transition '${name}': verification_report must point to an existing report file`,
       );
     }
-    if ((await readField(name, 'branch_status')) !== 'handled') {
-      fail(`ERROR: Cannot transition '${name}': branch_status must be handled`);
-    }
   } else if (event === 'verify-fail') {
     await requirePhase(name, 'verify');
+  } else if (event === 'archive-confirm') {
+    await requirePhase(name, 'archive');
+    if ((await readField(name, 'verify_result')) !== 'pass') {
+      fail(`ERROR: Cannot transition '${name}': verify_result must be pass before archiving`);
+    }
+    if ((await readField(name, 'archived')) === 'true') {
+      fail(`ERROR: Cannot transition '${name}': already archived`);
+    }
   } else if (event === 'preset-escalate') {
     // preset (hotfix/tweak) → full: rewind phase to design so the agent can
     // supplement a Design Doc before continuing. Unlike verify-fail /
@@ -704,6 +742,11 @@ async function transition(output: CommandOutput, name: string, event: string): P
     await requirePhase(name, 'archive');
     if ((await readField(name, 'verify_result')) !== 'pass') {
       fail(`ERROR: Cannot transition '${name}': verify_result must be pass before archiving`);
+    }
+    if ((await readField(name, 'archive_confirmation')) !== 'confirmed') {
+      fail(
+        `ERROR: Cannot transition '${name}': archive_confirmation must be confirmed before archiving`,
+      );
     }
   }
   await applyTransitionEvent(output, name, event as ClassicTransitionEvent);
@@ -998,7 +1041,7 @@ function resolveBuildRecoveryAction(
     if (buildMode === 'subagent-driven-development' && (pending > 0 || planPending > 0)) {
       return subagentDispatch === 'confirmed'
         ? 'Recovery action: Plan-ready pause is stale because build decisions are already selected. Clear build_pause to null, then inspect the first unchecked task (OpenSpec or plan additions) against recent git history/diff. If implemented, check it off; otherwise dispatch a real background subagent. Do not execute the pending task directly in the main window.'
-        : 'Recovery action: Plan-ready pause is stale and subagent dispatch is not confirmed. Confirm a real background subagent/Task/multi-agent dispatcher and set subagent_dispatch to confirmed, or set build_mode to executing-plans before continuing.';
+        : 'Recovery action: Plan-ready pause is stale and subagent dispatch is not confirmed. Return to /comet-build Step 2 capability preflight. Confirm a real background subagent/Task/multi-agent dispatcher and set subagent_dispatch to confirmed, or remove the unavailable mode and set build_mode to executing-plans before continuing.';
     }
     if (pending > 0 || planPending > 0) {
       return 'Recovery action: Plan-ready pause is stale because build decisions are already selected. Clear build_pause to null, then continue from the first unchecked task.';
@@ -1021,7 +1064,7 @@ function resolveBuildRecoveryAction(
     if (buildMode === 'subagent-driven-development') {
       return subagentDispatch === 'confirmed'
         ? 'Recovery action: Read tasks.md and the Superpowers plan (which may include additions beyond OpenSpec), then inspect the first unchecked task against recent git history/diff. If implemented, check it off; otherwise dispatch a real background subagent. Do not execute the pending task directly in the main window.'
-        : 'Recovery action: Subagent dispatch is not confirmed. Confirm a real background subagent/Task/multi-agent dispatcher and set subagent_dispatch to confirmed, or set build_mode to executing-plans before continuing.';
+        : 'Recovery action: Subagent dispatch is not confirmed. Return to /comet-build Step 2 capability preflight. Confirm a real background subagent/Task/multi-agent dispatcher and set subagent_dispatch to confirmed, or remove the unavailable mode and set build_mode to executing-plans before continuing.';
     }
     return 'Recovery action: Read tasks.md and continue from first unchecked task.';
   }
@@ -1029,7 +1072,7 @@ function resolveBuildRecoveryAction(
     if (buildMode === 'subagent-driven-development') {
       return subagentDispatch === 'confirmed'
         ? 'Recovery action: Read the Superpowers plan, then inspect the first unchecked Superpowers plan task against recent git history/diff. If implemented, check it off; otherwise dispatch a real background subagent. Do not execute the pending task directly in the main window.'
-        : 'Recovery action: Subagent dispatch is not confirmed. Confirm a real background subagent/Task/multi-agent dispatcher and set subagent_dispatch to confirmed, or set build_mode to executing-plans before continuing.';
+        : 'Recovery action: Subagent dispatch is not confirmed. Return to /comet-build Step 2 capability preflight. Confirm a real background subagent/Task/multi-agent dispatcher and set subagent_dispatch to confirmed, or remove the unavailable mode and set build_mode to executing-plans before continuing.';
     }
     return 'Recovery action: Read the Superpowers plan and continue from the first unchecked plan task.';
   }
@@ -1038,18 +1081,22 @@ function resolveBuildRecoveryAction(
 
 async function recoverVerify(output: CommandOutput, name: string): Promise<void> {
   const result = await readField(name, 'verify_result');
+  const failures = await readField(name, 'verify_failures');
   const mode = await readField(name, 'verify_mode');
   const report = await readField(name, 'verification_report');
   const branch = await readField(name, 'branch_status');
   output.stdout.push(
     '  Verification:',
     fieldStatus('verify_result', result),
+    `  - verify_failures: ${failures || '0'}`,
     fieldStatus('verify_mode', mode),
     fieldStatus('verification_report', report, report),
-    fieldStatus('branch_status', branch),
+    branch === 'handled'
+      ? '  - branch_status: LEGACY (handled before archive; archive still owns final closure)'
+      : '  - branch_status: DEFERRED (handled after the archive commit)',
     '',
-    result === 'pass' && branch === 'handled'
-      ? 'Recovery action: Verification complete. Run guard to transition to archive.'
+    result === 'pass'
+      ? 'Recovery action: Verification complete. Continue to archive; branch handling happens after archive changes are committed.'
       : result === 'fail'
         ? 'Recovery action: Verification failed and rolled back to build. Resume from /comet-build.'
         : 'Recovery action: Verification not yet started or in progress. Run scale assessment then verify.',
@@ -1057,12 +1104,16 @@ async function recoverVerify(output: CommandOutput, name: string): Promise<void>
 }
 
 async function recoverArchive(output: CommandOutput, name: string): Promise<void> {
+  const archiveConfirmation = await readField(name, 'archive_confirmation');
   output.stdout.push(
     '  Archive:',
     fieldStatus('verify_result', await readField(name, 'verify_result')),
+    fieldStatus('archive_confirmation', archiveConfirmation),
     fieldStatus('archived', await readField(name, 'archived')),
     '',
-    'Recovery action: Run /comet-archive to complete archiving.',
+    archiveConfirmation === 'confirmed'
+      ? 'Recovery action: Archive is confirmed. Run /comet-archive to complete archiving.'
+      : 'Recovery action: Ask for final archive confirmation in /comet-archive before running the archive command.',
   );
 }
 
@@ -1136,8 +1187,105 @@ async function scale(output: CommandOutput, name: string): Promise<void> {
   );
 }
 
+function parseRecordCheckOptions(args: string[]): {
+  command: string;
+  exitCode: number;
+  cwd?: string;
+} {
+  let command: string | undefined;
+  let exitCodeText: string | undefined;
+  let cwd: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const option = args[index];
+    if (!['--command', '--exit-code', '--cwd'].includes(option)) {
+      fail(`ERROR: Unknown option: ${option}`);
+    }
+    const value = args[index + 1];
+    if (value === undefined) fail(`ERROR: Missing value for option: ${option}`);
+    if (option === '--command') command = value;
+    else if (option === '--exit-code') exitCodeText = value;
+    else cwd = value;
+  }
+  if (command === undefined) fail('ERROR: Missing option: --command');
+  if (exitCodeText === undefined) fail('ERROR: Missing option: --exit-code');
+  if (!/^-?\d+$/u.test(exitCodeText)) fail('ERROR: --exit-code must be an integer');
+  return { command, exitCode: Number(exitCodeText), ...(cwd === undefined ? {} : { cwd }) };
+}
+
+async function recordCheck(
+  output: CommandOutput,
+  name: string,
+  scopeText: string,
+  args: string[],
+): Promise<void> {
+  validateChangeName(name);
+  if (scopeText !== 'build' && scopeText !== 'verify') {
+    fail(`ERROR: Invalid command check scope: '${scopeText}'`);
+  }
+  const options = parseRecordCheckOptions(args);
+  const { label, directory, file } = await stateFile(name);
+  if (label !== `openspec/changes/${name}` || !(await exists(file))) {
+    fail(`ERROR: command checks require an active change: ${name}`);
+  }
+  try {
+    const projection = await readClassicState(directory, { migrate: false });
+    if (!projection.classic || !projection.run) {
+      throw new Error('command checks require an existing synchronized Classic Run');
+    }
+    const { run } = await validateClassicRuntimeRun(directory, projection);
+    const recorded = await recordCommandCheck(directory, run, {
+      scope: scopeText as CommandCheckScope,
+      ...options,
+    });
+    output.stderr.push(
+      green(
+        `[RECORDED] ${recorded.scope} exit=${recorded.exitCode} cwd=${recorded.cwd} command=${recorded.command}`,
+      ),
+    );
+  } catch (error) {
+    fail(`ERROR: ${(error as Error).message}`);
+  }
+}
+
 function required(args: string[], count: number, usage: string): void {
   if (args.length < count) fail(usage);
+}
+
+function requiredExact(args: string[], count: number, usage: string): void {
+  if (args.length !== count) fail(usage);
+}
+
+async function selectChange(output: CommandOutput, name: string): Promise<void> {
+  validateChangeName(name);
+  try {
+    const selection = await selectCurrentChange(process.cwd(), name);
+    output.stderr.push(
+      green(
+        `[SELECTED] current change: ${selection.change}${selection.branch ? ` (branch: ${selection.branch})` : ''}`,
+      ),
+    );
+  } catch (error) {
+    fail(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function currentChange(output: CommandOutput): Promise<void> {
+  const resolution = await resolveCurrentChange(process.cwd());
+  if (resolution.status === 'selected') {
+    output.stdout.push(resolution.selection.change);
+    return;
+  }
+  if (resolution.status === 'missing') {
+    fail('ERROR: no current change selected\nUse: comet-state.mjs select <change-name>');
+  }
+  fail(
+    `ERROR: current change selection is stale: ${resolution.reason}\nUse: comet-state.mjs select <change-name>`,
+  );
+}
+
+async function clearSelection(output: CommandOutput): Promise<void> {
+  await clearCurrentChange(process.cwd());
+  output.stderr.push(green('[CLEARED] current change selection'));
 }
 
 export const classicStateCommand: ClassicCommandHandler = async (args) => {
@@ -1165,9 +1313,25 @@ export const classicStateCommand: ClassicCommandHandler = async (args) => {
     } else if (subcommand === 'scale') {
       required(rest, 1, 'Usage: comet-state.mjs scale <change-name>');
       await scale(output, rest[0]);
+    } else if (subcommand === 'record-check') {
+      required(
+        rest,
+        2,
+        'Usage: comet state record-check <change> <build|verify> --command <text> --exit-code <int> [--cwd <path>]',
+      );
+      await recordCheck(output, rest[0], rest[1], rest.slice(2));
     } else if (subcommand === 'task-checkoff') {
       required(rest, 2, 'Usage: comet-state.mjs task-checkoff <file> <task-text>');
       await taskCheckoff(output, rest[0], rest[1]);
+    } else if (subcommand === 'select') {
+      requiredExact(rest, 1, 'Usage: comet-state.mjs select <change-name>');
+      await selectChange(output, rest[0]);
+    } else if (subcommand === 'current') {
+      requiredExact(rest, 0, 'Usage: comet-state.mjs current');
+      await currentChange(output);
+    } else if (subcommand === 'clear-selection') {
+      requiredExact(rest, 0, 'Usage: comet-state.mjs clear-selection');
+      await clearSelection(output);
     } else if (subcommand === 'next') {
       required(rest, 1, 'Usage: comet-state.mjs next <change-name>');
       await next(output, rest[0]);

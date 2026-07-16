@@ -9,7 +9,13 @@ import { openspecCommand } from '../commands/openspec.js';
 import { migrateDocsCommand } from '../commands/migrate-docs.js';
 import { updateCommand } from '../commands/update.js';
 import { uninstallCommand } from '../commands/uninstall.js';
+import {
+  PUBLIC_CLASSIC_COMMANDS,
+  runClassicFacade,
+  type PublicClassicCommand,
+} from '../commands/classic.js';
 import { getCurrentVersion } from '../../platform/version/version.js';
+import { COMET_TAGLINE } from './comet-banner.js';
 import {
   skillCheckCommand,
   skillInstallCommand,
@@ -53,7 +59,7 @@ const collect = (value: string, previous: string[]): string[] => [...previous, v
 
 program
   .name('comet')
-  .description('Agent Skill Harness Phase-Guarded Automation From Idea To Archive')
+  .description(COMET_TAGLINE)
   .version(getCurrentVersion(), '-v, --version', 'output the current version');
 
 program
@@ -202,7 +208,7 @@ program
   .command('eval')
   .description('Evaluate a Skill or eval manifest with one command')
   .argument('[target]', 'Local Skill directory, SKILL.md, or comet/eval.yaml')
-  .option('--project <dir>', 'Repository root that contains eval/', '.')
+  .option('--project <dir>', 'Repository root that contains eval/')
   .option('--manifest <path>', 'Path to comet/eval.yaml')
   .option('--skill-path <path>', 'Local Skill directory or SKILL.md')
   .option('--skill-name <name>', 'Skill name used with --skill-path')
@@ -215,6 +221,24 @@ program
   .action(async (target, options) => {
     await evalFacadeCommand(target, options);
   });
+
+const classicDescriptions: Record<PublicClassicCommand, string> = {
+  state: 'Read and update Classic workflow state',
+  guard: 'Check Classic workflow phase guards',
+  handoff: 'Create and inspect Classic workflow handoffs',
+  archive: 'Archive completed Classic workflow changes',
+};
+
+for (const command of PUBLIC_CLASSIC_COMMANDS) {
+  program
+    .command(`${command} [args...]`)
+    .description(classicDescriptions[command])
+    .allowUnknownOption()
+    .allowExcessArguments()
+    .action(async (args: string[]) => {
+      process.exitCode = await runClassicFacade(command, args);
+    });
+}
 
 const skill = program
   .command('skill')

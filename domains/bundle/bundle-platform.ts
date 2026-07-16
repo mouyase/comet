@@ -9,6 +9,7 @@ import type {
 import { copyFile, ensureDir, fileExists, writeFile } from '../../platform/fs/file-system.js';
 import { computeRuleDestPath, formatRuleContent } from '../skill/platform-install.js';
 import {
+  getPlatformConfigDir,
   getPlatformSkillsDir,
   PLATFORMS,
   type Platform,
@@ -18,6 +19,7 @@ export interface PlatformBundleLayout {
   platform: string;
   scope: 'project' | 'global';
   baseDir: string;
+  configRoot: string;
   skillsRoot: string;
   rulesRoot: string | null;
   hooksSupported: boolean;
@@ -68,6 +70,7 @@ export function listBundlePlatformTargets(options: {
         platform: platform.id,
         scope: options.scope,
         baseDir,
+        configRoot: path.join(baseDir, getPlatformConfigDir(platform, options.scope)),
         skillsRoot: path.join(platformRoot, 'skills'),
         rulesRoot: rulesRoot(platform, baseDir, options.scope),
         hooksSupported: capabilities.has('hooks'),
@@ -102,12 +105,16 @@ export function planBundleRule(
 }
 
 function hookDestination(target: BundlePlatformTarget, hookId: string): string | null {
-  const platformRoot = path.dirname(target.layout.skillsRoot);
+  const platformRoot = target.layout.configRoot;
+  if (target.platform.hookConfigFile) {
+    return path.join(platformRoot, target.platform.hookConfigFile);
+  }
   switch (target.platform.hookFormat) {
     case 'claude-code':
       return path.join(platformRoot, 'settings.local.json');
     case 'qwen':
     case 'qoder':
+    case 'codebuddy':
     case 'gemini':
       return path.join(platformRoot, 'settings.json');
     case 'windsurf':
@@ -276,7 +283,8 @@ async function applyHookInstallFile(file: PlatformInstallFile): Promise<void> {
   switch (operation.format) {
     case 'claude-code':
     case 'qwen':
-    case 'qoder': {
+    case 'qoder':
+    case 'codebuddy': {
       hooks.PreToolUse = mergeCommandHookGroup(
         asHookGroups(hooks.PreToolUse),
         matcher,

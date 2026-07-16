@@ -30,10 +30,12 @@ function classicState(): ClassicState {
     designDoc: 'docs/superpowers/specs/design.md',
     plan: 'docs/superpowers/plans/plan.md',
     verifyResult: 'fail',
+    verifyFailures: 2,
     verificationReport: 'docs/verification.md',
     branchStatus: 'handled',
     createdAt: '2026-06-01',
     verifiedAt: '2026-06-02',
+    archiveConfirmation: null,
     archived: false,
     directOverride: true,
     handoffContext: '.comet/handoff/context.json',
@@ -197,6 +199,7 @@ describe('Classic state projection', () => {
     ['verify_result', 'maybe'],
     ['branch_status', 'open'],
     ['artifact_layout', 'future'],
+    ['archive_confirmation', 'yes'],
     ['classic_profile', 'other'],
   ])('rejects invalid %s values', async (field, value) => {
     await writeClassicState(changeDir, { classic: classicState(), run: runState() });

@@ -2,7 +2,7 @@ import path from 'path';
 import { checkbox, select } from '@inquirer/prompts';
 
 import { getBaseDir, type InstallScope } from '../../platform/install/detect.js';
-import { getPlatformSkillsDir } from '../../platform/install/platforms.js';
+import { PLATFORMS, getPlatformSkillsDir } from '../../platform/install/platforms.js';
 import {
   removeCometSkillsForPlatform,
   removeCometRulesForPlatform,
@@ -10,11 +10,13 @@ import {
   removeWorkingDirs,
   removeCometProjectInstructions,
 } from '../../domains/skill/uninstall.js';
-import { detectInstalledCometTargets } from './update.js';
+import { detectInstalledCometTargets, type InstalledCometTarget } from './update.js';
 import {
   listProjectRegistryEntries,
+  findProjectRegistryEntry,
   removeProjectInstallation,
   upsertProjectInstallation,
+  type ProjectRegistryTarget,
 } from '../../platform/install/project-registry.js';
 import { assertProjectScopeOptions, resolveProjectScopeMode } from './project-scope-selection.js';
 
@@ -24,6 +26,8 @@ interface UninstallOptions {
   force?: boolean;
   allProjects?: boolean;
   currentProject?: boolean;
+  recoverProjectCleanup?: boolean;
+  recoveryTargets?: ProjectRegistryTarget[];
 }
 
 interface TargetUninstallResult {
@@ -33,11 +37,15 @@ interface TargetUninstallResult {
   skillsRemoved: number;
   rulesRemoved: number;
   hooksRemoved: number;
+  skillsFailed: number;
+  rulesFailed: number;
+  hooksFailed: number;
   workingDirsRemoved: number;
 }
 
 interface SingleProjectUninstallResult {
   projectPath: string;
+  projectScopeProcessed: boolean;
   targets: TargetUninstallResult[];
   workingDirsRemoved: number;
   projectInstructionsRemoved: number;
@@ -46,7 +54,30 @@ interface SingleProjectUninstallResult {
     totalSkillsRemoved: number;
     totalRulesRemoved: number;
     totalHooksRemoved: number;
+    totalFailures: number;
   };
+}
+
+function mergeCleanupTargets(
+  detectedTargets: InstalledCometTarget[],
+  recoveryTargets: ProjectRegistryTarget[],
+  recoverProjectCleanup: boolean,
+): InstalledCometTarget[] {
+  const targets = [...detectedTargets];
+  if (!recoverProjectCleanup) return targets;
+
+  const seen = new Set(targets.map((target) => `${target.scope}:${target.platform.id}`));
+  for (const recoveryTarget of recoveryTargets) {
+    const platform = PLATFORMS.find((candidate) => candidate.id === recoveryTarget.platform);
+    if (!platform) continue;
+
+    const key = `project:${platform.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push({ scope: 'project', platform, language: recoveryTarget.language });
+  }
+
+  return targets;
 }
 
 function currentProjectJson(result: SingleProjectUninstallResult | null): {
@@ -57,6 +88,9 @@ function currentProjectJson(result: SingleProjectUninstallResult | null): {
     skillsRemoved: number;
     rulesRemoved: number;
     hooksRemoved: number;
+    skillsFailed: number;
+    rulesFailed: number;
+    hooksFailed: number;
   }>;
   workingDirsRemoved: number;
   summary: SingleProjectUninstallResult['summary'];
@@ -71,6 +105,9 @@ function currentProjectJson(result: SingleProjectUninstallResult | null): {
         skillsRemoved: r.skillsRemoved,
         rulesRemoved: r.rulesRemoved,
         hooksRemoved: r.hooksRemoved,
+        skillsFailed: r.skillsFailed,
+        rulesFailed: r.rulesFailed,
+        hooksFailed: r.hooksFailed,
       })) ?? [],
     workingDirsRemoved: result?.workingDirsRemoved ?? 0,
     summary: result?.summary ?? {
@@ -78,6 +115,7 @@ function currentProjectJson(result: SingleProjectUninstallResult | null): {
       totalSkillsRemoved: 0,
       totalRulesRemoved: 0,
       totalHooksRemoved: 0,
+      totalFailures: 0,
     },
     projectInstructionsRemoved: result?.projectInstructionsRemoved ?? 0,
   };
@@ -88,23 +126,33 @@ async function uninstallSingleProject(
   options: UninstallOptions = {},
   log: (message: string) => void,
 ): Promise<SingleProjectUninstallResult | null> {
-  const targets = await detectInstalledCometTargets(projectPath, {
+  const detectedTargets = await detectInstalledCometTargets(projectPath, {
     scopes: options.scope ? [options.scope] : undefined,
+    respectDetectionPaths: options.scope === undefined,
   });
+  const targets = mergeCleanupTargets(
+    detectedTargets,
+    options.recoveryTargets ?? [],
+    options.recoverProjectCleanup === true,
+  );
 
-  if (targets.length === 0) {
+  if (targets.length === 0 && !options.recoverProjectCleanup) {
     return null;
   }
 
   const scopeLabel = (scope: InstallScope) =>
     scope === 'global' ? 'global' : `project (${projectPath})`;
 
-  log('  Found Comet installations on the following targets:\n');
-  for (const target of targets) {
-    const skillsDir = getPlatformSkillsDir(target.platform, target.scope);
-    const prefix = target.scope === 'global' ? '~/' : '';
-    log(`    ${target.platform.name} (${scopeLabel(target.scope)})`);
-    log(`      Path: ${prefix}${skillsDir}/skills/`);
+  if (targets.length > 0) {
+    log('  Found Comet installations on the following targets:\n');
+    for (const target of targets) {
+      const skillsDir = getPlatformSkillsDir(target.platform, target.scope);
+      const prefix = target.scope === 'global' ? '~/' : '';
+      log(`    ${target.platform.name} (${scopeLabel(target.scope)})`);
+      log(`      Path: ${prefix}${skillsDir}/skills/`);
+    }
+  } else {
+    log('  Found an indexed project with follow-on cleanup still pending.\n');
   }
 
   let selectedTargets = targets;
@@ -144,27 +192,41 @@ async function uninstallSingleProject(
   let totalSkills = 0;
   let totalRules = 0;
   let totalHooks = 0;
+  let totalFailures = 0;
   let projectInstructionsRemoved = 0;
 
   for (const target of selectedTargets) {
     const baseDir = getBaseDir(target.scope, projectPath);
 
-    const skillsResult = await removeCometSkillsForPlatform(baseDir, target.platform, target.scope);
-    totalSkills += skillsResult.removed;
-
-    const rulesResult = await removeCometRulesForPlatform(baseDir, target.platform, target.scope);
-    totalRules += rulesResult.removed;
-
     let hooksRemoved = 0;
+    let hooksFailed = 0;
     if (target.platform.supportsHooks) {
       const hooksResult = await removeCometHooksForPlatform(baseDir, target.platform, target.scope);
       hooksRemoved = hooksResult.removed;
+      hooksFailed = hooksResult.failed;
       totalHooks += hooksResult.removed;
+      totalFailures += hooksResult.failed;
     }
+
+    const rulesResult = await removeCometRulesForPlatform(baseDir, target.platform, target.scope);
+    totalRules += rulesResult.removed;
+    totalFailures += rulesResult.failed;
+
+    const skillsResult =
+      hooksFailed === 0 && rulesResult.failed === 0
+        ? await removeCometSkillsForPlatform(baseDir, target.platform, target.scope)
+        : { removed: 0, failed: 0 };
+    totalSkills += skillsResult.removed;
+    totalFailures += skillsResult.failed;
 
     log(
       `  ${target.platform.name} (${target.scope}): ${skillsResult.removed} skills, ${rulesResult.removed} rules, ${hooksRemoved} hooks removed`,
     );
+    if (skillsResult.failed + rulesResult.failed + hooksFailed > 0) {
+      log(
+        `  ${target.platform.name} (${target.scope}): cleanup failed; uninstall incomplete and follow-on cleanup skipped`,
+      );
+    }
 
     results.push({
       scope: target.scope,
@@ -173,13 +235,17 @@ async function uninstallSingleProject(
       skillsRemoved: skillsResult.removed,
       rulesRemoved: rulesResult.removed,
       hooksRemoved,
+      skillsFailed: skillsResult.failed,
+      rulesFailed: rulesResult.failed,
+      hooksFailed,
       workingDirsRemoved: 0,
     });
   }
 
   let workingDirsRemoved = 0;
-  const hasProjectScope = selectedTargets.some((t) => t.scope === 'project');
-  if (hasProjectScope) {
+  const hasProjectScope =
+    options.recoverProjectCleanup === true || selectedTargets.some((t) => t.scope === 'project');
+  if (hasProjectScope && totalFailures === 0) {
     const removeResult = await removeCometProjectInstructions(projectPath);
     projectInstructionsRemoved = removeResult.removed;
     if (projectInstructionsRemoved > 0) {
@@ -187,16 +253,21 @@ async function uninstallSingleProject(
     }
   }
 
-  if (hasProjectScope) {
+  if (hasProjectScope && totalFailures === 0) {
     const dirsResult = await removeWorkingDirs(projectPath);
     workingDirsRemoved = dirsResult.removed;
+    totalFailures += dirsResult.failed;
     if (workingDirsRemoved > 0) {
       log(`  Working directories: ${workingDirsRemoved} removed`);
+    }
+    if (dirsResult.failed > 0) {
+      log(`  Working directories: cleanup failed (${dirsResult.failed})`);
     }
   }
 
   return {
     projectPath,
+    projectScopeProcessed: hasProjectScope,
     targets: results,
     workingDirsRemoved,
     projectInstructionsRemoved,
@@ -205,6 +276,7 @@ async function uninstallSingleProject(
       totalSkillsRemoved: totalSkills,
       totalRulesRemoved: totalRules,
       totalHooksRemoved: totalHooks,
+      totalFailures,
     },
   };
 }
@@ -212,7 +284,8 @@ async function uninstallSingleProject(
 async function refreshRegistryAfterProjectUninstall(
   result: SingleProjectUninstallResult | null,
 ): Promise<void> {
-  if (!result?.targets.some((target) => target.scope === 'project')) return;
+  if (!result?.projectScopeProcessed) return;
+  if (result.summary.totalFailures > 0) return;
 
   const remaining = await detectInstalledCometTargets(result.projectPath, { scopes: ['project'] });
   if (remaining.length === 0) {
@@ -234,23 +307,17 @@ async function uninstallAllIndexedProjects(
   const registryProjects = await listProjectRegistryEntries({ strict: true });
   const results = [];
   const runnableProjects = [];
-  let staleRemoved = 0;
+  const staleRemoved = 0;
 
-  for (const project of registryProjects) {
-    const projectPath = project.path;
+  for (const registryProject of registryProjects) {
+    const projectPath = registryProject.path;
     try {
       const targets = await detectInstalledCometTargets(projectPath, { scopes: ['project'] });
       if (targets.length === 0) {
-        if (await removeProjectInstallation(projectPath)) staleRemoved++;
-        results.push({
-          projectPath,
-          status: 'skipped',
-          reason: 'no project-scope Comet install detected',
-          targets: [],
-        });
+        runnableProjects.push({ projectPath, targets, registryProject });
         continue;
       }
-      runnableProjects.push({ projectPath, targets });
+      runnableProjects.push({ projectPath, targets, registryProject });
     } catch (error) {
       results.push({
         projectPath,
@@ -283,11 +350,19 @@ async function uninstallAllIndexedProjects(
   }
 
   for (const project of runnableProjects) {
-    const { projectPath, targets } = project;
+    const { projectPath, targets, registryProject } = project;
     try {
       const result = await uninstallSingleProject(
         projectPath,
-        { ...options, scope: 'project', allProjects: false, currentProject: true, force: true },
+        {
+          ...options,
+          scope: 'project',
+          allProjects: false,
+          currentProject: true,
+          force: true,
+          recoverProjectCleanup: true,
+          recoveryTargets: registryProject.lastTargets,
+        },
         log,
       );
 
@@ -295,7 +370,7 @@ async function uninstallAllIndexedProjects(
 
       results.push({
         projectPath,
-        status: result ? 'uninstalled' : 'skipped',
+        status: result ? (result.summary.totalFailures > 0 ? 'failed' : 'uninstalled') : 'skipped',
         targets: targets.map((target) => ({
           scope: target.scope,
           platform: target.platform.id,
@@ -307,6 +382,7 @@ async function uninstallAllIndexedProjects(
           totalSkillsRemoved: 0,
           totalRulesRemoved: 0,
           totalHooksRemoved: 0,
+          totalFailures: 0,
         },
         projectInstructionsRemoved: result?.projectInstructionsRemoved ?? 0,
         workingDirsRemoved: result?.workingDirsRemoved ?? 0,
@@ -369,7 +445,16 @@ export async function uninstallCommand(
     return;
   }
 
-  const result = await uninstallSingleProject(projectPath, options, log);
+  const registeredProject = await findProjectRegistryEntry(projectPath, registryProjects);
+  const result = await uninstallSingleProject(
+    projectPath,
+    {
+      ...options,
+      recoverProjectCleanup: Boolean(registeredProject) && options.scope !== 'global',
+      recoveryTargets: registeredProject?.lastTargets,
+    },
+    log,
+  );
 
   if (!result) {
     if (options.json) {
@@ -392,6 +477,11 @@ export async function uninstallCommand(
   log(`    Skills removed: ${result.summary.totalSkillsRemoved}`);
   log(`    Rules removed: ${result.summary.totalRulesRemoved}`);
   log(`    Hooks removed: ${result.summary.totalHooksRemoved}`);
+  if (result.summary.totalFailures > 0) {
+    log(`    Cleanup failures: ${result.summary.totalFailures}`);
+    log(`\n  Uninstall incomplete. Preserved remaining project state.\n`);
+    return;
+  }
   if (result.projectInstructionsRemoved > 0) {
     log(`    Project instructions removed: ${result.projectInstructionsRemoved}`);
   }

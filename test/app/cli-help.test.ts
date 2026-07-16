@@ -1,4 +1,5 @@
 import { spawnSync } from 'child_process';
+import { readFileSync } from 'fs';
 import path from 'path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { ensureCliBuilt } from '../helpers/ensure-cli-built.js';
@@ -17,6 +18,28 @@ describe('CLI help text', () => {
   beforeAll(async () => {
     await ensureCliBuilt(repositoryRoot);
   }, 120_000);
+
+  it('uses the evaluated-workflows tagline in CLI and package metadata', () => {
+    const help = runCli('--help');
+    const packageJson = JSON.parse(
+      readFileSync(path.join(repositoryRoot, 'package.json'), 'utf8'),
+    ) as { description: string; version: string };
+    const packageLock = JSON.parse(
+      readFileSync(path.join(repositoryRoot, 'package-lock.json'), 'utf8'),
+    ) as { version: string; packages: { '': { version: string } } };
+    const assetsManifest = JSON.parse(
+      readFileSync(path.join(repositoryRoot, 'assets', 'manifest.json'), 'utf8'),
+    ) as { version: string };
+    const tagline = 'Agent Skill Harness For Turning Ideas Into Evaluated Workflows';
+
+    expect(help.status, help.stderr).toBe(0);
+    expect(help.stdout).toContain(tagline);
+    expect(packageJson.description).toBe(tagline);
+    expect(packageJson.version).toBe('0.4.0-beta.6');
+    expect(packageLock.version).toBe('0.4.0-beta.6');
+    expect(packageLock.packages[''].version).toBe('0.4.0-beta.6');
+    expect(assetsManifest.version).toBe('0.4.0-beta.6');
+  });
 
   it('marks bundle as the advanced backend and skill Engine runs as advanced', () => {
     const creatorHelp = runCli('creator', '--help');
@@ -49,6 +72,27 @@ describe('CLI help text', () => {
     expect(skillHelp.stdout).not.toContain('validate [options] <skill>');
     expect(skillHelp.stdout).not.toContain('inspect [options] <skill>');
     expect(skillHelp.stdout).not.toContain('resume [options]');
+  });
+
+  it('exposes only the four stable Classic facade commands at the root', () => {
+    const help = runCli('--help');
+
+    expect(help.status, help.stderr).toBe(0);
+    expect(help.stdout).toContain('Read and update Classic workflow state');
+    expect(help.stdout).toContain('Check Classic workflow phase guards');
+    expect(help.stdout).toContain('Create and inspect Classic workflow handoffs');
+    expect(help.stdout).toContain('Archive completed Classic workflow changes');
+    expect(help.stdout).not.toMatch(/^\s+(validate|intent|hook-guard)\b/mu);
+    const facadeDescriptions = [
+      'Read and update Classic workflow state',
+      'Check Classic workflow phase guards',
+      'Create and inspect Classic workflow handoffs',
+      'Archive completed Classic workflow changes',
+    ];
+    expect(
+      facadeDescriptions.filter((description) => help.stdout.includes(description)),
+    ).toHaveLength(4);
+    expect(help.stdout).toMatch(/^\s+resume-probe \[options\] \[path\]\s+Probe whether/mu);
   });
 
   it('separates repository evals from Engine Run runtime checks', () => {
